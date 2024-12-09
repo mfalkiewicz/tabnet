@@ -1,0 +1,8 @@
+pytest>=6.0
+black
+isort
+mypy
+flake8
+versioneer
+sphinx
+tox 

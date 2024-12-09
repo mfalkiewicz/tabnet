@@ -1,0 +1,8 @@
+include versioneer.py
+include pytorch_tabnet/_version.py
+include LICENSE
+include README.md
+include requirements.txt
+include setup.cfg
+recursive-include tests *
+recursive-include docs * 

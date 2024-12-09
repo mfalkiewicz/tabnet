@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional, Union, Tuple, Callable, Protocol
 import torch
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
@@ -37,7 +37,15 @@ import zipfile
 import warnings
 import copy
 import scipy
+from pyspark.sql import DataFrame
+from .spark_utils import SparkTrainDataset, SparkPredictDataset
 
+# Define the DataLoaderProtocol
+class DataLoaderProtocol(Protocol):
+    def __iter__(self):
+        ...
+    def __len__(self):
+        ...
 
 @dataclass
 class TabModel(BaseEstimator):
@@ -709,43 +717,69 @@ class TabModel(BaseEstimator):
             self.network.parameters(), **self.optimizer_params
         )
 
-    def _construct_loaders(self, X_train, y_train, eval_set):
-        """Generate dataloaders for train and eval set.
+    def _construct_loaders(
+        self,
+        X_train: Union[np.ndarray, DataFrame],
+        y_train: Union[np.ndarray, str, DataFrame],
+        eval_set: Optional[List[Tuple[Union[np.ndarray, DataFrame], Union[np.ndarray, str, DataFrame]]]]
+    ) -> Tuple[DataLoaderProtocol, List[DataLoaderProtocol]]:
+        """Construct dataloaders with Spark support"""
+        if isinstance(X_train, DataFrame):
+            # Handle Spark DataFrame
+            if isinstance(y_train, str):
+                train_dataset = SparkTrainDataset(
+                    X_train,
+                    [col for col in X_train.columns if col != y_train],
+                    y_train
+                )
+            else:
+                train_dataset = SparkTrainDataset(
+                    X_train,
+                    X_train.columns,
+                    y_train.columns
+                )
+                
+            train_dataloader = train_dataset.make_loader(
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_epochs=None
+            )
+            
+            valid_dataloaders = []
+            if eval_set:
+                for X_val, y_val in eval_set:
+                    val_dataset = SparkTrainDataset(
+                        X_val,
+                        X_val.columns if isinstance(y_val, DataFrame) else [col for col in X_val.columns if col != y_val],
+                        y_val.columns if isinstance(y_val, DataFrame) else y_val
+                    )
+                    valid_dataloaders.append(
+                        val_dataset.make_loader(
+                            batch_size=self.batch_size,
+                            shuffle=False,
+                            num_epochs=1
+                        )
+                    )
+                    
+            return train_dataloader, valid_dataloaders
+            
+        else:
+            # Original implementation for numpy/pandas
+            y_train_mapped = self.prepare_target(y_train)
+            for i, (X, y) in enumerate(eval_set or []):
+                y_mapped = self.prepare_target(y)
+                eval_set[i] = (X, y_mapped)
 
-        Parameters
-        ----------
-        X_train : np.array
-            Train set.
-        y_train : np.array
-            Train targets.
-        eval_set : list of tuple
-            List of eval tuple set (X, y).
-
-        Returns
-        -------
-        train_dataloader : `torch.utils.data.Dataloader`
-            Training dataloader.
-        valid_dataloaders : list of `torch.utils.data.Dataloader`
-            List of validation dataloaders.
-
-        """
-        # all weights are not allowed for this type of model
-        y_train_mapped = self.prepare_target(y_train)
-        for i, (X, y) in enumerate(eval_set):
-            y_mapped = self.prepare_target(y)
-            eval_set[i] = (X, y_mapped)
-
-        train_dataloader, valid_dataloaders = create_dataloaders(
-            X_train,
-            y_train_mapped,
-            eval_set,
-            self.updated_weights,
-            self.batch_size,
-            self.num_workers,
-            self.drop_last,
-            self.pin_memory,
-        )
-        return train_dataloader, valid_dataloaders
+            return create_dataloaders(
+                X_train,
+                y_train_mapped,
+                eval_set,
+                self.updated_weights,
+                self.batch_size,
+                self.num_workers,
+                self.drop_last,
+                self.pin_memory,
+            )
 
     def _compute_feature_importances(self, X):
         """Compute global feature importance.

@@ -7,9 +7,20 @@ import json
 from sklearn.utils import check_array
 import pandas as pd
 import warnings
+from typing import Union, List, Tuple, Optional, Sequence, Any, TypeVar
+from numpy.typing import NDArray, ArrayLike
+from pyspark.sql import DataFrame
+from torch import Tensor
+
+# Type aliases
+TensorOrArray = Union[torch.Tensor, np.ndarray]
+DataFrameLike = Union[pd.DataFrame, DataFrame]
+FloatArray = NDArray[np.float32]
+InputArray = Union[NDArray[np.float32], NDArray[np.float64]]
+InputType = Union[DataFrameLike, InputArray]
 
 
-class TorchDataset(Dataset):
+class TorchDataset(Dataset[Tuple[Tensor, Tensor]]):
     """
     Format for numpy array
 
@@ -29,8 +40,13 @@ class TorchDataset(Dataset):
         return len(self.x)
 
     def __getitem__(self, index):
-        x, y = self.x[index], self.y[index]
-        return x, y
+        if isinstance(self.x, pd.DataFrame):
+            x = self.x.iloc[index].values
+        elif hasattr(self.x, 'toPandas'):  # PySpark DataFrame
+            x = self.x.toPandas().iloc[index].values
+        else:
+            x = self.x[index]
+        return x, self.y[index]
 
 
 class SparseTorchDataset(Dataset):
@@ -69,14 +85,16 @@ class PredictDataset(Dataset):
     """
 
     def __init__(self, x):
-        self.x = x
+        if isinstance(x, pd.DataFrame):
+            self.x = x.values  # Convert DataFrame to numpy array
+        else:
+            self.x = x
 
     def __len__(self):
         return len(self.x)
 
     def __getitem__(self, index):
-        x = self.x[index]
-        return x
+        return self.x[index]
 
 
 class SparsePredictDataset(Dataset):
@@ -498,13 +516,11 @@ class ComplexEncoder(json.JSONEncoder):
 
 def check_input(X):
     """
-    Raise a clear error if X is a pandas dataframe
-    and check array according to scikit rules
+    Check input according to scikit rules
     """
     if isinstance(X, (pd.DataFrame, pd.Series)):
-        err_message = "Pandas DataFrame are not supported: apply X.values when calling fit"
-        raise TypeError(err_message)
-    check_array(X, accept_sparse=True)
+        return X.values  # Convert to numpy array instead of raising error
+    return X
 
 
 def check_warm_start(warm_start, from_unsupervised):
@@ -550,3 +566,42 @@ def check_embedding_parameters(cat_dims, cat_idxs, cat_emb_dim):
         cat_emb_dims = [cat_emb_dims[i] for i in sorted_idxs]
 
     return cat_dims, cat_idxs, cat_emb_dims
+
+
+class TrainDataset(Dataset[Tuple[Tensor, Tensor]]):
+    """Dataset for training with pandas DataFrame or numpy array input"""
+    
+    def __init__(self, x: Union[DataFrameLike, FloatArray], y: FloatArray) -> None:
+        self.x = x
+        self.y = y
+
+    def __len__(self) -> int:
+        return len(self.x)
+
+    def __getitem__(self, index: int) -> Tuple[Tensor, Tensor]:
+        if isinstance(self.x, (pd.DataFrame, DataFrame)):
+            x = torch.tensor(self.x.iloc[index].values, dtype=torch.float32)
+        else:
+            x = torch.tensor(self.x[index], dtype=torch.float32)
+        return x, torch.tensor(self.y[index], dtype=torch.float32)
+
+
+class SparkPredictDataset(Dataset[Tensor]):
+    """Dataset for prediction with Spark DataFrame input"""
+    
+    def __init__(self, x: InputType) -> None:
+        if isinstance(x, DataFrame):  # PySpark DataFrame
+            self.x: pd.DataFrame = x.toPandas()
+        elif isinstance(x, pd.DataFrame):
+            self.x: pd.DataFrame = x
+        else:
+            self.x: InputArray = x
+
+    def __len__(self) -> int:
+        return len(self.x)
+
+    def __getitem__(self, index: int) -> Tensor:
+        if isinstance(self.x, pd.DataFrame):
+            values = self.x.iloc[index].values
+            return torch.tensor(values, dtype=torch.float32)
+        return torch.tensor(self.x[index], dtype=torch.float32)
