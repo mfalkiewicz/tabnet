@@ -143,3 +143,14 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Versioneer
+versioneer.py
+pytorch_tabnet/_version.py
+
+# Python package build artifacts
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/

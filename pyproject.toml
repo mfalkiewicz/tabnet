@@ -75,3 +75,11 @@ dev = [
     "types-setuptools",
     "tomli>=2.0.0",
 ]
+
+[tool.versioneer]
+VCS = "git"
+style = "pep440"
+versionfile_source = "pytorch_tabnet/_version.py"
+versionfile_build = "pytorch_tabnet/_version.py"
+tag_prefix = "v"
+parentdir_prefix = "pytorch_tabnet-"
