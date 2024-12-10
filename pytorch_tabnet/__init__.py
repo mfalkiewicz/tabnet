@@ -10,6 +10,3 @@ from .tab_model import TabNetRegressor, TabNetClassifier
 from .tab_network import TabNet
 
 __all__ = ["TabNetRegressor", "TabNetClassifier", "TabNet", "__version__"]
-from . import _version
-
-__version__ = _version.get_versions()["version"]
