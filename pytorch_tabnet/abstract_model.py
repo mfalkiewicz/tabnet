@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Any, Dict, Optional, Union, Tuple, Callable, Protocol
+from typing import List, Any, Dict, Optional, Union, Tuple, Protocol
 import torch
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
@@ -17,7 +17,7 @@ from pytorch_tabnet.utils import (
     check_input,
     check_warm_start,
     create_group_matrix,
-    check_embedding_parameters
+    check_embedding_parameters,
 )
 from pytorch_tabnet.callbacks import (
     CallbackContainer,
@@ -38,18 +38,18 @@ import warnings
 import copy
 import scipy
 from pyspark.sql import DataFrame
-from .spark_utils import SparkTrainDataset, SparkPredictDataset
+from .spark_utils import SparkTrainDataset
+
 
 # Define the DataLoaderProtocol
 class DataLoaderProtocol(Protocol):
-    def __iter__(self):
-        ...
-    def __len__(self):
-        ...
+    def __iter__(self): ...
+    def __len__(self): ...
+
 
 @dataclass
 class TabModel(BaseEstimator):
-    """ Class for TabNet model."""
+    """Class for TabNet model."""
 
     n_d: int = 8
     n_a: int = 8
@@ -93,9 +93,9 @@ class TabModel(BaseEstimator):
         self.optimizer_fn = copy.deepcopy(self.optimizer_fn)
         self.scheduler_fn = copy.deepcopy(self.scheduler_fn)
 
-        updated_params = check_embedding_parameters(self.cat_dims,
-                                                    self.cat_idxs,
-                                                    self.cat_emb_dim)
+        updated_params = check_embedding_parameters(
+            self.cat_dims, self.cat_idxs, self.cat_emb_dim
+        )
         self.cat_dims, self.cat_idxs, self.cat_emb_dim = updated_params
 
     def __update__(self, **kwargs):
@@ -148,7 +148,7 @@ class TabModel(BaseEstimator):
         from_unsupervised=None,
         warm_start=False,
         augmentations=None,
-        compute_importance=True
+        compute_importance=True,
     ):
         """Train a neural network stored in self.network
         Using train_dataloader for training data and
@@ -259,7 +259,6 @@ class TabModel(BaseEstimator):
 
         # Training loop over epochs
         for epoch_idx in range(self.max_epochs):
-
             # Call method on_epoch_begin for all callbacks
             self._callback_container.on_epoch_begin(epoch_idx)
 
@@ -366,8 +365,9 @@ class TabModel(BaseEstimator):
                 masks[key] = csc_matrix.dot(
                     value.cpu().detach().numpy(), self.reducing_matrix
                 )
-            original_feat_explain = csc_matrix.dot(M_explain.cpu().detach().numpy(),
-                                                   self.reducing_matrix)
+            original_feat_explain = csc_matrix.dot(
+                M_explain.cpu().detach().numpy(), self.reducing_matrix
+            )
             res_explain.append(original_feat_explain)
 
             if batch_nb == 0:
@@ -425,9 +425,7 @@ class TabModel(BaseEstimator):
                 init_params[key] = val
         saved_params["init_params"] = init_params
 
-        class_attrs = {
-            "preds_mapper": self.preds_mapper
-        }
+        class_attrs = {"preds_mapper": self.preds_mapper}
         saved_params["class_attrs"] = class_attrs
 
         # Create folder
@@ -720,60 +718,70 @@ class TabModel(BaseEstimator):
     def _construct_loaders(
         self,
         X_train: Union[np.ndarray, DataFrame],
-        y_train: Union[np.ndarray, str, DataFrame],
-        eval_set: Optional[List[Tuple[Union[np.ndarray, DataFrame], Union[np.ndarray, str, DataFrame]]]]
+        y_train: Union[np.ndarray, DataFrame, str],
+        eval_set: Optional[
+            List[Tuple[Union[np.ndarray, DataFrame], Union[np.ndarray, DataFrame, str]]]
+        ] = None,
     ) -> Tuple[DataLoaderProtocol, List[DataLoaderProtocol]]:
         """Construct dataloaders with Spark support"""
         if isinstance(X_train, DataFrame):
             # Handle Spark DataFrame
             if isinstance(y_train, str):
                 train_dataset = SparkTrainDataset(
-                    X_train,
-                    [col for col in X_train.columns if col != y_train],
-                    y_train
+                    X_train, [col for col in X_train.columns if col != y_train], y_train
                 )
             else:
+                assert isinstance(
+                    y_train, DataFrame
+                ), "y_train must be DataFrame or str when X_train is DataFrame"
                 train_dataset = SparkTrainDataset(
-                    X_train,
-                    X_train.columns,
-                    y_train.columns
+                    X_train, list(X_train.columns), list(y_train.columns)
                 )
-                
+
             train_dataloader = train_dataset.make_loader(
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_epochs=None
+                batch_size=self.batch_size, shuffle=True, num_epochs=None
             )
-            
-            valid_dataloaders = []
+
+            valid_dataloaders: List[DataLoaderProtocol] = []
             if eval_set:
                 for X_val, y_val in eval_set:
-                    val_dataset = SparkTrainDataset(
-                        X_val,
-                        X_val.columns if isinstance(y_val, DataFrame) else [col for col in X_val.columns if col != y_val],
-                        y_val.columns if isinstance(y_val, DataFrame) else y_val
-                    )
+                    if not isinstance(X_val, DataFrame):
+                        raise TypeError(
+                            "X_val must be DataFrame when X_train is DataFrame"
+                        )
+
+                    if isinstance(y_val, str):
+                        val_cols = [col for col in X_val.columns if col != y_val]
+                        target = y_val
+                    else:
+                        assert isinstance(
+                            y_val, DataFrame
+                        ), "y_val must be DataFrame or str"
+                        val_cols = list(X_val.columns)
+                        target = list(y_val.columns)
+
+                    val_dataset = SparkTrainDataset(X_val, val_cols, target)
                     valid_dataloaders.append(
                         val_dataset.make_loader(
-                            batch_size=self.batch_size,
-                            shuffle=False,
-                            num_epochs=1
+                            batch_size=self.batch_size, shuffle=False, num_epochs=1
                         )
                     )
-                    
+
             return train_dataloader, valid_dataloaders
-            
+
         else:
             # Original implementation for numpy/pandas
             y_train_mapped = self.prepare_target(y_train)
-            for i, (X, y) in enumerate(eval_set or []):
-                y_mapped = self.prepare_target(y)
-                eval_set[i] = (X, y_mapped)
+            eval_set_mapped = []
+            if eval_set:
+                for X, y in eval_set:
+                    y_mapped = self.prepare_target(y)
+                    eval_set_mapped.append((X, y_mapped))
 
             return create_dataloaders(
                 X_train,
                 y_train_mapped,
-                eval_set,
+                eval_set_mapped,
                 self.updated_weights,
                 self.batch_size,
                 self.num_workers,

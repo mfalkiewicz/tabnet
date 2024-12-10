@@ -7,7 +7,7 @@ from pyspark.sql import DataFrame as SparkDataFrame
 import pandas as pd
 
 # Type variables
-T_co = TypeVar('T_co', covariant=True)
+T_co = TypeVar("T_co", covariant=True)
 Shape = Tuple[int, ...]
 
 # Basic types
@@ -23,20 +23,16 @@ BatchType = Union[TensorLike, Dict[str, TensorLike]]
 TargetType = Union[ArrayLike, str]
 MetricsType = Dict[str, float]
 
+
 class DataLoaderProtocol(Protocol[T_co]):
-    def __iter__(self) -> Iterator[T_co]:
-        ...
-    
-    def __next__(self) -> T_co:
-        ...
-    
-    def __len__(self) -> int:
-        ...
+    def __iter__(self) -> Iterator[T_co]: ...
+
+    def __next__(self) -> T_co: ...
+
+    def __len__(self) -> int: ...
+
 
 class ModelOutput(Protocol):
-    def cpu(self) -> ModelOutput:
-        ...
-    def detach(self) -> ModelOutput:
-        ...
-    def numpy(self) -> FloatArray:
-        ... 
+    def cpu(self) -> ModelOutput: ...
+    def detach(self) -> ModelOutput: ...
+    def numpy(self) -> FloatArray: ...

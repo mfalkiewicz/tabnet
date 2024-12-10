@@ -4,11 +4,10 @@ import torch
 import numpy as np
 import scipy
 import json
-from sklearn.utils import check_array
 import pandas as pd
 import warnings
-from typing import Union, List, Tuple, Optional, Sequence, Any, TypeVar
-from numpy.typing import NDArray, ArrayLike
+from typing import Union, Tuple, Optional
+from numpy.typing import NDArray
 from pyspark.sql import DataFrame
 from torch import Tensor
 
@@ -42,7 +41,7 @@ class TorchDataset(Dataset[Tuple[Tensor, Tensor]]):
     def __getitem__(self, index):
         if isinstance(self.x, pd.DataFrame):
             x = self.x.iloc[index].values
-        elif hasattr(self.x, 'toPandas'):  # PySpark DataFrame
+        elif hasattr(self.x, "toPandas"):  # PySpark DataFrame
             x = self.x.toPandas().iloc[index].values
         else:
             x = self.x[index]
@@ -373,7 +372,9 @@ def check_list_groups(list_groups, input_dim):
         for group_pos, group in enumerate(list_groups):
             msg = f"Groups must be given as a list of list, but found {group} in position {group_pos}."  # noqa
             assert isinstance(group, list), msg
-            assert len(group) > 0, "Empty groups are forbidding please remove empty groups []"
+            assert (
+                len(group) > 0
+            ), "Empty groups are forbidding please remove empty groups []"
 
     n_elements_in_groups = np.sum([len(group) for group in list_groups])
     flat_list = []
@@ -381,15 +382,19 @@ def check_list_groups(list_groups, input_dim):
         flat_list.extend(group)
     unique_elements = np.unique(flat_list)
     n_unique_elements_in_groups = len(unique_elements)
-    msg = f"One feature can only appear in one group, please check your grouped_features."
+    msg = (
+        "One feature can only appear in one group, please check your grouped_features."
+    )
     assert n_unique_elements_in_groups == n_elements_in_groups, msg
 
     highest_feat = np.max(unique_elements)
-    assert highest_feat < input_dim, f"Number of features is {input_dim} but one group contains {highest_feat}."  # noqa
+    assert (
+        highest_feat < input_dim
+    ), f"Number of features is {input_dim} but one group contains {highest_feat}."  # noqa
     return
 
 
-def filter_weights(weights):
+def filter_weights(weights: Optional[NDArray[np.float32]]) -> None:
     """
     This function makes sure that weights are in correct format for
     regression and multitask TabNet
@@ -529,7 +534,9 @@ def check_warm_start(warm_start, from_unsupervised):
     """
     if warm_start and from_unsupervised is not None:
         warn_msg = "warm_start=True and from_unsupervised != None: "
-        warn_msg = "warm_start will be ignore, training will start from unsupervised weights"
+        warn_msg = (
+            "warm_start will be ignore, training will start from unsupervised weights"
+        )
         warnings.warn(warn_msg)
     return
 
@@ -570,13 +577,13 @@ def check_embedding_parameters(cat_dims, cat_idxs, cat_emb_dim):
 
 class TrainDataset(Dataset[Tuple[Tensor, Tensor]]):
     """Dataset for training with pandas DataFrame or numpy array input"""
-    
+
     def __init__(self, x: Union[DataFrameLike, FloatArray], y: FloatArray) -> None:
         self.x = x
         self.y = y
 
     def __len__(self) -> int:
-        return len(self.x)
+        return len(self.x)  # type: ignore[arg-type]  # mypy can't verify all input types support len()
 
     def __getitem__(self, index: int) -> Tuple[Tensor, Tensor]:
         if isinstance(self.x, (pd.DataFrame, DataFrame)):
@@ -588,20 +595,21 @@ class TrainDataset(Dataset[Tuple[Tensor, Tensor]]):
 
 class SparkPredictDataset(Dataset[Tensor]):
     """Dataset for prediction with Spark DataFrame input"""
-    
+
     def __init__(self, x: InputType) -> None:
-        if isinstance(x, DataFrame):  # PySpark DataFrame
-            self.x: pd.DataFrame = x.toPandas()
-        elif isinstance(x, pd.DataFrame):
-            self.x: pd.DataFrame = x
+        # Convert input to either pandas DataFrame or numpy array
+        if isinstance(x, DataFrame):  # Spark DataFrame
+            self._data = x.toPandas()
+        elif isinstance(x, pd.DataFrame):  # Pandas DataFrame
+            self._data = x
         else:
-            self.x: InputArray = x
+            self._data = x  # Numpy array
 
     def __len__(self) -> int:
-        return len(self.x)
+        return len(self._data)  # type: ignore[arg-type]  # mypy can't verify all input types support len()
 
     def __getitem__(self, index: int) -> Tensor:
-        if isinstance(self.x, pd.DataFrame):
-            values = self.x.iloc[index].values
+        if isinstance(self._data, pd.DataFrame):
+            values = self._data.iloc[index].values
             return torch.tensor(values, dtype=torch.float32)
-        return torch.tensor(self.x[index], dtype=torch.float32)
+        return torch.tensor(self._data[index], dtype=torch.float32)

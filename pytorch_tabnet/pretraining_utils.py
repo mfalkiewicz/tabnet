@@ -3,7 +3,7 @@ from pytorch_tabnet.utils import (
     create_sampler,
     SparsePredictDataset,
     PredictDataset,
-    check_input
+    check_input,
 )
 import scipy
 
