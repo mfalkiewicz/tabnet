@@ -10,6 +10,7 @@ from typing import Union, Tuple, Optional
 from numpy.typing import NDArray
 from pyspark.sql import DataFrame
 from torch import Tensor
+import numbers
 
 # Type aliases
 TensorOrArray = Union[torch.Tensor, np.ndarray]
@@ -118,52 +119,56 @@ class SparsePredictDataset(Dataset):
 
 
 def create_sampler(weights, y_train):
-    """
-    This creates a sampler from the given weights
+    """Create sampler for weighted sampling during training.
 
     Parameters
     ----------
-    weights : either 0, 1, dict or iterable
-        if 0 (default) : no weights will be applied
-        if 1 : classification only, will balanced class with inverse frequency
-        if dict : keys are corresponding class values are sample weights
-        if iterable : list or np array must be of length equal to nb elements
-                      in the training set
-    y_train : np.array
-        Training targets
+    weights : float or numpy.ndarray or dict
+        Sample weights. Can be:
+        - 1 for automatic class balancing
+        - dict mapping class values to weights
+        - numpy array of sample weights
+    y_train : numpy.ndarray
+        Training labels
+
+    Returns
+    -------
+    tuple
+        Need shuffle flag and sampler object
     """
-    if isinstance(weights, int):
-        if weights == 0:
-            need_shuffle = True
-            sampler = None
-        elif weights == 1:
-            need_shuffle = False
-            class_sample_count = np.array(
-                [len(np.where(y_train == t)[0]) for t in np.unique(y_train)]
-            )
-
-            weights = 1.0 / class_sample_count
-
-            samples_weight = np.array([weights[t] for t in y_train])
-
-            samples_weight = torch.from_numpy(samples_weight)
-            samples_weight = samples_weight.double()
-            sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
-        else:
-            raise ValueError("Weights should be either 0, 1, dictionnary or list.")
+    if isinstance(weights, (int, float)) and weights == 1:
+        # Compute class weights for balanced sampling
+        unique_classes = np.unique(y_train)
+        class_weights = {}
+        for cls in unique_classes:
+            class_weights[cls] = 1.0 / np.sum(y_train == cls)
+        
+        # Normalize weights
+        total = sum(class_weights.values())
+        class_weights = {k: v/total for k, v in class_weights.items()}
+        
+        # Convert to sample weights
+        sample_weights = np.array([class_weights[y[0] if isinstance(y, np.ndarray) else y] for y in y_train])
     elif isinstance(weights, dict):
-        # custom weights per class
-        need_shuffle = False
-        samples_weight = np.array([weights[t] for t in y_train])
-        sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
+        # Convert class weights to sample weights
+        sample_weights = np.array([weights[y[0] if isinstance(y, np.ndarray) else y] for y in y_train])
     else:
-        # custom weights
-        if len(weights) != len(y_train):
-            raise ValueError("Custom weights should match number of train samples.")
-        need_shuffle = False
-        samples_weight = np.array(weights)
-        sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
-    return need_shuffle, sampler
+        sample_weights = weights
+
+    # Ensure weights are float32 and 1D
+    sample_weights = np.asarray(sample_weights, dtype=np.float32).ravel()
+    
+    if np.all(sample_weights == 0):
+        warnings.warn("All weights are zero, using uniform weights instead.")
+        sample_weights = np.ones_like(sample_weights, dtype=np.float32)
+    
+    # Create sampler
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+    return False, sampler
 
 
 def create_dataloaders(
@@ -203,14 +208,18 @@ def create_dataloaders(
     train_dataloader, valid_dataloader : torch.DataLoader, torch.DataLoader
         Training and validation dataloaders
     """
-    need_shuffle, sampler = create_sampler(weights, y_train)
+    need_shuffle = True
+    sampler = None
+    
+    if weights is not None and weights != 0:
+        need_shuffle, sampler = create_sampler(weights, y_train)
 
     if scipy.sparse.issparse(X_train):
         train_dataloader = DataLoader(
             SparseTorchDataset(X_train.astype(np.float32), y_train),
             batch_size=batch_size,
             sampler=sampler,
-            shuffle=need_shuffle,
+            shuffle=need_shuffle if sampler is None else False,
             num_workers=num_workers,
             drop_last=drop_last,
             pin_memory=pin_memory,
@@ -220,34 +229,35 @@ def create_dataloaders(
             TorchDataset(X_train.astype(np.float32), y_train),
             batch_size=batch_size,
             sampler=sampler,
-            shuffle=need_shuffle,
+            shuffle=need_shuffle if sampler is None else False,
             num_workers=num_workers,
             drop_last=drop_last,
             pin_memory=pin_memory,
         )
 
     valid_dataloaders = []
-    for X, y in eval_set:
-        if scipy.sparse.issparse(X):
-            valid_dataloaders.append(
-                DataLoader(
-                    SparseTorchDataset(X.astype(np.float32), y),
-                    batch_size=batch_size,
-                    shuffle=False,
-                    num_workers=num_workers,
-                    pin_memory=pin_memory,
+    if eval_set:
+        for X, y in eval_set:
+            if scipy.sparse.issparse(X):
+                valid_dataloaders.append(
+                    DataLoader(
+                        SparseTorchDataset(X.astype(np.float32), y),
+                        batch_size=batch_size,
+                        shuffle=False,
+                        num_workers=num_workers,
+                        pin_memory=pin_memory,
+                    )
                 )
-            )
-        else:
-            valid_dataloaders.append(
-                DataLoader(
-                    TorchDataset(X.astype(np.float32), y),
-                    batch_size=batch_size,
-                    shuffle=False,
-                    num_workers=num_workers,
-                    pin_memory=pin_memory,
+            else:
+                valid_dataloaders.append(
+                    DataLoader(
+                        TorchDataset(X.astype(np.float32), y),
+                        batch_size=batch_size,
+                        shuffle=False,
+                        num_workers=num_workers,
+                        pin_memory=pin_memory,
+                    )
                 )
-            )
 
     return train_dataloader, valid_dataloaders
 
@@ -613,3 +623,130 @@ class SparkPredictDataset(Dataset[Tensor]):
             values = self._data.iloc[index].values
             return torch.tensor(values, dtype=torch.float32)
         return torch.tensor(self._data[index], dtype=torch.float32)
+
+
+def check_input(X: Union[NDArray, pd.DataFrame, DataFrame]) -> Union[NDArray, pd.DataFrame, DataFrame]:
+    """Check input data type and format.
+
+    Parameters
+    ----------
+    X : Union[NDArray, pd.DataFrame, DataFrame]
+        Input data to check
+
+    Returns
+    -------
+    Union[NDArray, pd.DataFrame, DataFrame]
+        Validated input data
+    """
+    if not isinstance(X, (np.ndarray, pd.DataFrame, DataFrame)):
+        raise TypeError("X must be a numpy array, pandas DataFrame, or Spark DataFrame")
+
+    if isinstance(X, np.ndarray):
+        if X.ndim != 2:
+            raise ValueError("X must be 2-dimensional")
+        if not np.isfinite(X).all():
+            raise ValueError("X contains non-finite values")
+
+    return X
+
+
+def check_target(y: Union[NDArray, pd.Series, str]) -> Union[NDArray, str]:
+    """Check target data type and format.
+
+    Parameters
+    ----------
+    y : Union[NDArray, pd.Series, str]
+        Target data to check. Can be numpy array, pandas Series, or string (column name for Spark DataFrame)
+
+    Returns
+    -------
+    Union[NDArray, str]
+        Validated target data
+    """
+    if isinstance(y, pd.Series):
+        y = y.values
+    elif isinstance(y, str):
+        return y  # Column name for Spark DataFrame
+    elif not isinstance(y, np.ndarray):
+        raise TypeError("y must be a numpy array, pandas Series, or string (for Spark DataFrame)")
+
+    if isinstance(y, np.ndarray):
+        if y.ndim > 2:
+            raise ValueError("y must be 1-dimensional or 2-dimensional")
+        if not np.isfinite(y).all():
+            raise ValueError("y contains non-finite values")
+
+    return y
+
+
+def define_device(device_name: str) -> torch.device:
+    """Define the device to use for computations.
+
+    Parameters
+    ----------
+    device_name : str
+        Name of the device ('auto', 'cpu', 'cuda', or 'cuda:X')
+
+    Returns
+    -------
+    torch.device
+        Device to use
+    """
+    if device_name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        else:
+            return torch.device("cpu")
+    elif device_name.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA is not available")
+        return torch.device(device_name)
+    elif device_name == "cpu":
+        return torch.device("cpu")
+    else:
+        raise ValueError("Invalid device name. Use 'auto', 'cpu', 'cuda', or 'cuda:X'")
+
+
+class ComplexEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy arrays and other complex types."""
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        return super().default(obj)
+
+
+def stack_batches(list_y, list_y_mapping=None):
+    """Stack a list of batches together.
+
+    Parameters
+    ----------
+    list_y : list
+        List of arrays to stack
+    list_y_mapping : list, optional
+        List of arrays to stack for mapping, by default None
+
+    Returns
+    -------
+    tuple
+        Stacked arrays
+    """
+    if len(list_y) == 0:
+        return np.array([]), np.array([])
+    
+    if isinstance(list_y[0], torch.Tensor):
+        list_y = [y.cpu().detach().numpy() for y in list_y]
+    
+    y = np.concatenate(list_y, axis=0)
+    
+    if list_y_mapping is not None:
+        if isinstance(list_y_mapping[0], torch.Tensor):
+            list_y_mapping = [y.cpu().detach().numpy() for y in list_y_mapping]
+        y_mapping = np.concatenate(list_y_mapping, axis=0)
+    else:
+        y_mapping = None
+    
+    return y, y_mapping

@@ -1,14 +1,10 @@
-[build-system]
-requires = ["setuptools>=45", "wheel", "versioneer"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "pytorch_tabnet"
-dynamic = ["version"]
+version = "4.0.0"
 description = "PyTorch implementation of TabNet with Spark support"
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 dependencies = [
-    "torch>=1.8.0",
+    "torch>=2.1.0",  # For Apple Silicon GPU support
     "numpy>=1.19.0,<2.0.0",
     "scipy>=1.5.0",
     "pandas>=1.0.0",
@@ -19,24 +15,28 @@ dependencies = [
     "typing-extensions>=4.0.0"
 ]
 
+[build-system]
+requires = ["pdm-backend>=1.0.0"]
+build-backend = "pdm.backend"
+
 [tool.mypy]
 python_version = "3.10"
-warn_return_any = false
-warn_unused_configs = false
-disallow_untyped_defs = false
-disallow_incomplete_defs = false
-check_untyped_defs = false
-disallow_untyped_decorators = false
-no_implicit_optional = false
-warn_redundant_casts = false
-warn_unused_ignores = false
-warn_no_return = false
-warn_unreachable = false
-allow_subclassing_any = true
-strict_optional = false
-disable_error_code = ["override", "assignment"]
-implicit_reexport = true
-allow_redefinition = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+allow_subclassing_any = false
+strict_optional = true
+disable_error_code = []
+implicit_reexport = false
+allow_redefinition = false
 
 [[tool.mypy.overrides]]
 module = [
@@ -55,6 +55,9 @@ ignore_missing_imports = true
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')"
 ]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+#addopts = "-v --cov=pytorch_tabnet --cov-report=term-missing"
 
 [tool.black]
 line-length = 88
@@ -74,12 +77,5 @@ dev = [
     "pandas-stubs",
     "types-setuptools",
     "tomli>=2.0.0",
+    "coverage"
 ]
-
-[tool.versioneer]
-VCS = "git"
-style = "pep440"
-versionfile_source = "pytorch_tabnet/_version.py"
-versionfile_build = "pytorch_tabnet/_version.py"
-tag_prefix = "v"
-parentdir_prefix = "pytorch_tabnet-"

@@ -522,7 +522,7 @@ class TabNet(torch.nn.Module):
         virtual_batch_size=128,
         momentum=0.02,
         mask_type="sparsemax",
-        group_attention_matrix=[],
+        group_attention_matrix=None,
     ):
         """
         Defines TabNet network
@@ -830,8 +830,8 @@ class EmbeddingGenerator(torch.nn.Module):
 
         if cat_dims == [] and cat_idxs == []:
             self.skip_embedding = True
-            self.post_embed_dim = input_dim
-            self.embedding_group_matrix = group_matrix.to(group_matrix.device)
+            self.post_embed_dim = input_dim if input_dim is not None else 1
+            self.embedding_group_matrix = group_matrix if group_matrix is not None else torch.eye(self.post_embed_dim)
             return
         else:
             self.skip_embedding = False

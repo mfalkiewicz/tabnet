@@ -37,8 +37,12 @@ import zipfile
 import warnings
 import copy
 import scipy
-from pyspark.sql import DataFrame
-from .spark_utils import SparkTrainDataset
+try:
+    from pyspark.sql import DataFrame
+    _HAVE_PYSPARK = True
+except ImportError:
+    _HAVE_PYSPARK = False
+from .spark_utils import SparkDataset
 
 
 # Define the DataLoaderProtocol
@@ -149,6 +153,7 @@ class TabModel(BaseEstimator):
         warm_start=False,
         augmentations=None,
         compute_importance=True,
+        from_epoch=0,
     ):
         """Train a neural network stored in self.network
         Using train_dataloader for training data and
@@ -196,6 +201,13 @@ class TabModel(BaseEstimator):
             If True, current model parameters are used to start training
         compute_importance : bool
             Whether to compute feature importance
+        from_epoch : int
+            Start training from this epoch
+
+        Returns
+        -------
+        self : object
+            Returns self.
         """
         # update model name
 
@@ -210,6 +222,7 @@ class TabModel(BaseEstimator):
         self.pin_memory = pin_memory and (self.device.type != "cpu")
         self.augmentations = augmentations
         self.compute_importance = compute_importance
+        self.from_epoch = from_epoch
 
         if self.augmentations is not None:
             # This ensure reproducibility
@@ -258,7 +271,7 @@ class TabModel(BaseEstimator):
         self._callback_container.on_train_begin()
 
         # Training loop over epochs
-        for epoch_idx in range(self.max_epochs):
+        for epoch_idx in range(self.from_epoch, self.max_epochs):
             # Call method on_epoch_begin for all callbacks
             self._callback_container.on_epoch_begin(epoch_idx)
 
@@ -428,19 +441,30 @@ class TabModel(BaseEstimator):
         class_attrs = {"preds_mapper": self.preds_mapper}
         saved_params["class_attrs"] = class_attrs
 
-        # Create folder
-        Path(path).mkdir(parents=True, exist_ok=True)
+        # Remove .zip extension if present and create a temporary directory
+        base_path = str(path)
+        if base_path.endswith('.zip'):
+            base_path = base_path[:-4]
+        temp_dir = base_path + "_temp"
+        
+        # Create temp folder
+        Path(temp_dir).mkdir(parents=True, exist_ok=True)
 
         # Save models params
-        with open(Path(path).joinpath("model_params.json"), "w", encoding="utf8") as f:
+        with open(Path(temp_dir).joinpath("model_params.json"), "w", encoding="utf8") as f:
             json.dump(saved_params, f, cls=ComplexEncoder)
 
         # Save state_dict
-        torch.save(self.network.state_dict(), Path(path).joinpath("network.pt"))
-        shutil.make_archive(path, "zip", path)
-        shutil.rmtree(path)
-        print(f"Successfully saved model at {path}.zip")
-        return f"{path}.zip"
+        torch.save(self.network.state_dict(), Path(temp_dir).joinpath("network.pt"))
+            
+        # Create zip from temp directory
+        shutil.make_archive(base_path, "zip", temp_dir)
+        
+        # Clean up temp directory
+        shutil.rmtree(temp_dir)
+        
+        print(f"Successfully saved model at {base_path}.zip")
+        return f"{base_path}.zip"
 
     def load_model(self, filepath):
         """Load TabNet model.
@@ -718,59 +742,55 @@ class TabModel(BaseEstimator):
     def _construct_loaders(
         self,
         X_train: Union[np.ndarray, DataFrame],
-        y_train: Union[np.ndarray, DataFrame, str],
+        y_train: Union[np.ndarray, str],
         eval_set: Optional[
-            List[Tuple[Union[np.ndarray, DataFrame], Union[np.ndarray, DataFrame, str]]]
-        ] = None,
+            List[Tuple[Union[np.ndarray, DataFrame], Union[np.ndarray, str]]]
+        ],
     ) -> Tuple[DataLoaderProtocol, List[DataLoaderProtocol]]:
-        """Construct dataloaders with Spark support"""
-        if isinstance(X_train, DataFrame):
-            # Handle Spark DataFrame
+        """Construct dataloaders with or without Spark support."""
+        
+        if _HAVE_PYSPARK and isinstance(X_train, DataFrame):
+            # Spark DataFrame handling
             if isinstance(y_train, str):
-                train_dataset = SparkTrainDataset(
-                    X_train, [col for col in X_train.columns if col != y_train], y_train
+                train_dataset = SparkDataset(
+                    X_train,
+                    [col for col in X_train.columns if col != y_train],
+                    y_train
                 )
             else:
-                assert isinstance(
-                    y_train, DataFrame
-                ), "y_train must be DataFrame or str when X_train is DataFrame"
-                train_dataset = SparkTrainDataset(
-                    X_train, list(X_train.columns), list(y_train.columns)
-                )
+                raise ValueError("When using Spark DataFrames, y_train must be a column name (str)")
 
             train_dataloader = train_dataset.make_loader(
-                batch_size=self.batch_size, shuffle=True, num_epochs=None
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_epochs=None  # Infinite for training
             )
 
-            valid_dataloaders: List[DataLoaderProtocol] = []
+            valid_dataloaders = []
             if eval_set:
                 for X_val, y_val in eval_set:
                     if not isinstance(X_val, DataFrame):
-                        raise TypeError(
-                            "X_val must be DataFrame when X_train is DataFrame"
-                        )
+                        raise TypeError("X_val must be DataFrame when X_train is DataFrame")
+                    if not isinstance(y_val, str):
+                        raise TypeError("y_val must be column name (str) when using Spark DataFrames")
 
-                    if isinstance(y_val, str):
-                        val_cols = [col for col in X_val.columns if col != y_val]
-                        target = y_val
-                    else:
-                        assert isinstance(
-                            y_val, DataFrame
-                        ), "y_val must be DataFrame or str"
-                        val_cols = list(X_val.columns)
-                        target = list(y_val.columns)
-
-                    val_dataset = SparkTrainDataset(X_val, val_cols, target)
+                    val_dataset = SparkDataset(
+                        X_val,
+                        [col for col in X_val.columns if col != y_val],
+                        y_val
+                    )
                     valid_dataloaders.append(
                         val_dataset.make_loader(
-                            batch_size=self.batch_size, shuffle=False, num_epochs=1
+                            batch_size=self.batch_size,
+                            shuffle=False,
+                            num_epochs=1
                         )
                     )
 
             return train_dataloader, valid_dataloaders
 
         else:
-            # Original implementation for numpy/pandas
+            # Original implementation for numpy arrays
             y_train_mapped = self.prepare_target(y_train)
             eval_set_mapped = []
             if eval_set:
@@ -787,6 +807,32 @@ class TabModel(BaseEstimator):
                 self.num_workers,
                 self.drop_last,
                 self.pin_memory,
+            )
+
+    def _prepare_input(self, X: Union[np.ndarray, DataFrame]) -> Union[np.ndarray, DataFrame]:
+        """Prepare input data.
+        
+        Parameters
+        ----------
+        X : Union[np.ndarray, DataFrame]
+            Input data
+        
+        Returns
+        -------
+        Union[np.ndarray, DataFrame]
+            Prepared input data
+        """
+        if isinstance(X, np.ndarray):
+            if len(X.shape) == 1:
+                raise ValueError("Expected 2D array, got 1D array instead")
+            self.input_dim = X.shape[1]
+            return X
+        elif _HAVE_PYSPARK and isinstance(X, DataFrame):
+            return X
+        else:
+            raise ValueError(
+                f"Input type {type(X)} is not supported. "
+                "Expected numpy array or Spark DataFrame"
             )
 
     def _compute_feature_importances(self, X):

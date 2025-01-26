@@ -201,9 +201,7 @@ class Metric:
 
 
 class AUC(Metric):
-    """
-    AUC.
-    """
+    """AUC metric for binary classification."""
 
     def __init__(self):
         self._name = "auc"
@@ -216,22 +214,28 @@ class AUC(Metric):
         Parameters
         ----------
         y_true : np.ndarray
-            Target matrix or vector
+            Target values (binary)
         y_score : np.ndarray
-            Score matrix or vector
+            Predicted probabilities for positive class
 
         Returns
         -------
         float
-            AUC of predictions vs targets.
+            AUC of predictions vs targets
         """
-        return roc_auc_score(y_true, y_score[:, 1])
+        # Ensure inputs are properly shaped
+        y_true = y_true.reshape(-1)
+        y_score = y_score.reshape(-1)
+        
+        # Handle case where y_score is class probabilities (2 columns)
+        if len(y_score.shape) > 1 and y_score.shape[1] == 2:
+            y_score = y_score[:, 1]
+            
+        return roc_auc_score(y_true, y_score)
 
 
 class Accuracy(Metric):
-    """
-    Accuracy.
-    """
+    """Accuracy metric for classification."""
 
     def __init__(self):
         self._name = "accuracy"
@@ -243,24 +247,31 @@ class Accuracy(Metric):
 
         Parameters
         ----------
-        y_true: np.ndarray
-            Target matrix or vector
-        y_score: np.ndarray
-            Score matrix or vector
+        y_true : np.ndarray
+            Target values
+        y_score : np.ndarray
+            Predicted probabilities or scores
 
         Returns
         -------
         float
-            Accuracy of predictions vs targets.
+            Accuracy of predictions vs targets
         """
-        y_pred = np.argmax(y_score, axis=1)
+        # For binary classification with probability outputs
+        if len(y_score.shape) == 1 or (len(y_score.shape) == 2 and y_score.shape[1] == 1):
+            y_pred = (y_score.reshape(-1) > 0.5).astype(int)
+        # For multiclass with probability outputs
+        elif len(y_score.shape) == 2 and y_score.shape[1] > 1:
+            y_pred = np.argmax(y_score, axis=1)
+        else:
+            y_pred = y_score
+
+        y_true = y_true.reshape(-1)
         return accuracy_score(y_true, y_pred)
 
 
 class BalancedAccuracy(Metric):
-    """
-    Balanced Accuracy.
-    """
+    """Balanced Accuracy metric for classification."""
 
     def __init__(self):
         self._name = "balanced_accuracy"
@@ -268,28 +279,35 @@ class BalancedAccuracy(Metric):
 
     def __call__(self, y_true, y_score):
         """
-        Compute Accuracy of predictions.
+        Compute Balanced Accuracy of predictions.
 
         Parameters
         ----------
         y_true : np.ndarray
-            Target matrix or vector
+            Target values
         y_score : np.ndarray
-            Score matrix or vector
+            Predicted probabilities or scores
 
         Returns
         -------
         float
-            Accuracy of predictions vs targets.
+            Balanced Accuracy of predictions vs targets
         """
-        y_pred = np.argmax(y_score, axis=1)
+        # For binary classification with probability outputs
+        if len(y_score.shape) == 1 or (len(y_score.shape) == 2 and y_score.shape[1] == 1):
+            y_pred = (y_score.reshape(-1) > 0.5).astype(int)
+        # For multiclass with probability outputs
+        elif len(y_score.shape) == 2 and y_score.shape[1] > 1:
+            y_pred = np.argmax(y_score, axis=1)
+        else:
+            y_pred = y_score
+
+        y_true = y_true.reshape(-1)
         return balanced_accuracy_score(y_true, y_pred)
 
 
 class LogLoss(Metric):
-    """
-    LogLoss.
-    """
+    """Log Loss metric for classification."""
 
     def __init__(self):
         self._name = "logloss"
@@ -302,16 +320,30 @@ class LogLoss(Metric):
         Parameters
         ----------
         y_true : np.ndarray
-            Target matrix or vector
+            Target values
         y_score : np.ndarray
-            Score matrix or vector
+            Predicted probabilities
 
         Returns
         -------
         float
-            LogLoss of predictions vs targets.
+            LogLoss of predictions vs targets
         """
-        return log_loss(y_true, y_score)
+        # Ensure y_true is properly shaped
+        y_true = y_true.reshape(-1)
+        
+        # For binary classification
+        if len(y_score.shape) == 1 or (len(y_score.shape) == 2 and y_score.shape[1] == 1):
+            y_score = y_score.reshape(-1)
+            # Clip probabilities to avoid numerical issues
+            y_score = np.clip(y_score, 1e-15, 1 - 1e-15)
+            return log_loss(y_true, y_score, labels=[0, 1])
+        
+        # For multiclass
+        else:
+            # Clip probabilities to avoid numerical issues
+            y_score = np.clip(y_score, 1e-15, 1 - 1e-15)
+            return log_loss(y_true, y_score)
 
 
 class MAE(Metric):

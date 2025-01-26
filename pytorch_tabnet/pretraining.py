@@ -22,6 +22,23 @@ from pytorch_tabnet.metrics import (
 )
 from pytorch_tabnet.abstract_model import TabModel
 import scipy
+from typing import List, Optional, Union, Dict, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame
+    from .spark_utils import SparkDataset
+else:
+    DataFrame = None
+    SparkDataset = None
+
+try:
+    from .spark_utils import SparkDataset
+    from pyspark.sql import DataFrame
+    _HAVE_PYSPARK = True
+except ImportError:
+    SparkDataset = None
+    DataFrame = None
+    _HAVE_PYSPARK = False
 
 
 class TabNetPretrainer(TabModel):
@@ -37,103 +54,101 @@ class TabNetPretrainer(TabModel):
     def compute_loss(self, output, embedded_x, obf_vars):
         return self.loss_fn(output, embedded_x, obf_vars)
 
-    def update_fit_params(
-        self,
-        weights,
-    ):
+    def update_fit_params(self, weights):
         self.updated_weights = weights
         filter_weights(self.updated_weights)
         self.preds_mapper = None
 
     def fit(
         self,
-        X_train,
-        eval_set=None,
-        eval_name=None,
-        loss_fn=None,
-        pretraining_ratio=0.5,
-        weights=0,
-        max_epochs=100,
-        patience=10,
-        batch_size=1024,
-        virtual_batch_size=128,
-        num_workers=0,
-        drop_last=True,
-        callbacks=None,
-        pin_memory=True,
-        warm_start=False,
+        X_train: Union[np.ndarray, DataFrame],
+        eval_set: Optional[List[Union[np.ndarray, DataFrame]]] = None,
+        eval_name: Optional[List[str]] = None,
+        loss_fn: Optional[callable] = None,
+        pretraining_ratio: float = 0.5,
+        weights: Union[int, np.ndarray] = 0,
+        max_epochs: int = 100,
+        patience: int = 10,
+        batch_size: int = 1024,
+        virtual_batch_size: int = 128,
+        num_workers: int = 0,
+        drop_last: bool = True,
+        callbacks: Optional[List[callable]] = None,
+        pin_memory: bool = True,
+        warm_start: bool = False,
     ):
-        """Train a neural network stored in self.network
-        Using train_dataloader for training data and
-        valid_dataloader for validation.
+        """Train a neural network for self-supervised learning.
 
         Parameters
         ----------
-        X_train : np.ndarray
-            Train set to reconstruct in self supervision
-        eval_set : list of np.array
-            List of evaluation set
-            The last one is used for early stopping
-        eval_name : list of str
-            List of eval set names.
-        eval_metric : list of str
-            List of evaluation metrics.
-            The last metric is used for early stopping.
-        loss_fn : callable or None
-            a PyTorch loss function
-            should be left to None for self supervised and non experts
+        X_train : Union[np.ndarray, DataFrame]
+            Training data, either numpy array or Spark DataFrame
+        eval_set : Optional[List[Union[np.ndarray, DataFrame]]]
+            List of evaluation sets
+        eval_name : Optional[List[str]]
+            Names for evaluation sets
+        loss_fn : Optional[callable]
+            Custom loss function
         pretraining_ratio : float
-            Between 0 and 1, percentage of feature to mask for reconstruction
-        weights : np.array
-            Sampling weights for each example.
+            Ratio of features to mask for reconstruction
+        weights : Union[int, np.ndarray]
+            Sample weights
         max_epochs : int
-            Maximum number of epochs during training
+            Maximum training epochs
         patience : int
-            Number of consecutive non improving epoch before early stopping
+            Early stopping patience
         batch_size : int
             Training batch size
         virtual_batch_size : int
-            Batch size for Ghost Batch Normalization (virtual_batch_size < batch_size)
+            Ghost Batch Normalization size
         num_workers : int
-            Number of workers used in torch.utils.data.DataLoader
+            DataLoader workers
         drop_last : bool
-            Whether to drop last batch during training
-        callbacks : list of callback function
-            List of custom callbacks
-        pin_memory: bool
-            Whether to set pin_memory to True or False during training
+            Whether to drop last incomplete batch
+        callbacks : Optional[List[callable]]
+            Training callbacks
+        pin_memory : bool
+            Whether to pin memory in DataLoader
+        warm_start : bool
+            Whether to warm start from previous fit
         """
-        # update model name
-
         self.max_epochs = max_epochs
         self.patience = patience
         self.batch_size = batch_size
         self.virtual_batch_size = virtual_batch_size
         self.num_workers = num_workers
         self.drop_last = drop_last
-        self.input_dim = X_train.shape[1]
-        self._stop_training = False
         self.pin_memory = pin_memory and (self.device.type != "cpu")
         self.pretraining_ratio = pretraining_ratio
         eval_set = eval_set if eval_set else []
+
+        if _HAVE_PYSPARK and isinstance(X_train, DataFrame):
+            self.input_dim = len(X_train.columns)
+        else:
+            self.input_dim = X_train.shape[1]
+
+        self._stop_training = False
 
         if loss_fn is None:
             self.loss_fn = self._default_loss
         else:
             self.loss_fn = loss_fn
 
-        check_input(X_train)
+        if _HAVE_PYSPARK and isinstance(X_train, DataFrame):
+            # For Spark DataFrames, we don't need to check input format
+            pass
+        else:
+            check_input(X_train)
 
-        self.update_fit_params(
-            weights,
-        )
+        self.update_fit_params(weights)
 
-        # Validate and reformat eval set depending on training data
+        # Validate eval sets
         eval_names = validate_eval_set(eval_set, eval_name, X_train)
+        
+        # Construct data loaders
         train_dataloader, valid_dataloaders = self._construct_loaders(X_train, eval_set)
 
         if not hasattr(self, "network") or not warm_start:
-            # model has never been fitted before of warm_start is False
             self._set_network()
 
         self._update_network_params()
@@ -141,21 +156,16 @@ class TabNetPretrainer(TabModel):
         self._set_optimizer()
         self._set_callbacks(callbacks)
 
-        # Call method on_train_begin for all callbacks
+        # Training loop
         self._callback_container.on_train_begin()
 
-        # Training loop over epochs
         for epoch_idx in range(self.max_epochs):
-            # Call method on_epoch_begin for all callbacks
             self._callback_container.on_epoch_begin(epoch_idx)
-
             self._train_epoch(train_dataloader)
 
-            # Apply predict epoch to all eval sets
             for eval_name, valid_dataloader in zip(eval_names, valid_dataloaders):
                 self._predict_epoch(eval_name, valid_dataloader)
 
-            # Call method on_epoch_end for all callbacks
             self._callback_container.on_epoch_end(
                 epoch_idx, logs=self.history.epoch_metrics
             )
@@ -163,9 +173,143 @@ class TabNetPretrainer(TabModel):
             if self._stop_training:
                 break
 
-        # Call method on_train_end for all callbacks
         self._callback_container.on_train_end()
         self.network.eval()
+
+    def _construct_loaders(
+        self,
+        X_train: Union[np.ndarray, DataFrame],
+        eval_set: Optional[List[Union[np.ndarray, DataFrame]]] = None
+    ) -> Tuple[DataLoader, List[DataLoader]]:
+        """Construct data loaders for training and evaluation.
+
+        Parameters
+        ----------
+        X_train : Union[np.ndarray, DataFrame]
+            Training data
+        eval_set : Optional[List[Union[np.ndarray, DataFrame]]]
+            List of evaluation sets
+
+        Returns
+        -------
+        Tuple[DataLoader, List[DataLoader]]
+            Training and evaluation data loaders
+        """
+        if _HAVE_PYSPARK and isinstance(X_train, DataFrame):
+            # Handle Spark DataFrame
+            train_dataset = SparkDataset(
+                X_train,
+                feature_cols=X_train.columns,
+            )
+            train_dataloader = train_dataset.make_loader(
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_epochs=None  # Infinite for training
+            )
+
+            valid_dataloaders = []
+            if eval_set:
+                for X_val in eval_set:
+                    if not isinstance(X_val, DataFrame):
+                        raise TypeError("Eval set must be DataFrame when X_train is DataFrame")
+                    
+                    val_dataset = SparkDataset(
+                        X_val,
+                        feature_cols=X_val.columns,
+                    )
+                    valid_dataloaders.append(
+                        val_dataset.make_loader(
+                            batch_size=self.batch_size,
+                            shuffle=False,
+                            num_epochs=1
+                        )
+                    )
+
+            return train_dataloader, valid_dataloaders
+
+        else:
+            # Handle numpy arrays
+            return create_dataloaders(
+                X_train,
+                eval_set,
+                self.updated_weights,
+                self.batch_size,
+                self.num_workers,
+                self.drop_last,
+                self.pin_memory,
+            )
+
+    def _train_epoch(self, train_loader):
+        """Train one epoch of the network.
+        
+        Parameters
+        ----------
+        train_loader : DataLoader
+            Training data loader
+        """
+        self.network.train()
+        
+        for batch_idx, data in enumerate(train_loader):
+            self._callback_container.on_batch_begin(batch_idx)
+            
+            if isinstance(data, dict):  # Petastorm loader returns dict
+                batch_data = torch.tensor(
+                    np.column_stack([data[col].numpy() for col in data.keys()]),
+                    device=self.device
+                ).float()
+            else:
+                batch_data = data.to(self.device).float()
+
+            self.optimizer.zero_grad()
+            
+            output, embedded_x, obf_vars = self.network(batch_data)
+            loss = self.compute_loss(output, embedded_x, obf_vars)
+            
+            loss.backward()
+            if self.clip_value:
+                clip_grad_norm_(self.network.parameters(), self.clip_value)
+                
+            self.optimizer.step()
+            
+            self._callback_container.on_batch_end(batch_idx)
+            
+        return
+
+    def _predict_epoch(self, name, loader):
+        """Predict an epoch and update metrics.
+        
+        Parameters
+        ----------
+        name : str
+            Name of the validation set
+        loader : DataLoader
+            Data loader for predictions
+        """
+        self.network.eval()
+        
+        list_loss = []
+        for batch_idx, data in enumerate(loader):
+            if isinstance(data, dict):  # Petastorm loader returns dict
+                batch_data = torch.tensor(
+                    np.column_stack([data[col].numpy() for col in data.keys()]),
+                    device=self.device
+                ).float()
+            else:
+                batch_data = data.to(self.device).float()
+                
+            output, embedded_x, obf_vars = self.network(batch_data)
+            loss = self.compute_loss(output, embedded_x, obf_vars)
+            list_loss.append(loss.cpu().detach().numpy())
+            
+        metrics_logs = {
+            metric_name: metric_func(list_loss)
+            for metric_name, metric_func in self._metrics.items()
+        }
+        
+        self.network.train()
+        self.history.epoch_metrics.update({name + "_" + k: v for k, v in metrics_logs.items()})
+        
+        return
 
     def _set_network(self):
         """Setup the network and explain matrix."""
@@ -239,126 +383,14 @@ class TabNetPretrainer(TabModel):
             self._metrics_names[-1] if len(self._metrics_names) > 0 else None
         )
 
-    def _construct_loaders(self, X_train, eval_set):
-        """Generate dataloaders for unsupervised train and eval set.
+    def _set_optimizer(self):
+        pass
 
-        Parameters
-        ----------
-        X_train : np.array
-            Train set.
-        eval_set : list of tuple
-            List of eval tuple set (X, y).
+    def _set_callbacks(self, callbacks):
+        pass
 
-        Returns
-        -------
-        train_dataloader : `torch.utils.data.Dataloader`
-            Training dataloader.
-        valid_dataloaders : list of `torch.utils.data.Dataloader`
-            List of validation dataloaders.
-
-        """
-        train_dataloader, valid_dataloaders = create_dataloaders(
-            X_train,
-            eval_set,
-            self.updated_weights,
-            self.batch_size,
-            self.num_workers,
-            self.drop_last,
-            self.pin_memory,
-        )
-        return train_dataloader, valid_dataloaders
-
-    def _train_epoch(self, train_loader):
-        """
-        Trains one epoch of the network in self.network
-
-        Parameters
-        ----------
-        train_loader : a :class: `torch.utils.data.Dataloader`
-            DataLoader with train set
-        """
-        self.network.train()
-
-        for batch_idx, X in enumerate(train_loader):
-            self._callback_container.on_batch_begin(batch_idx)
-
-            batch_logs = self._train_batch(X)
-
-            self._callback_container.on_batch_end(batch_idx, batch_logs)
-
-        epoch_logs = {"lr": self._optimizer.param_groups[-1]["lr"]}
-        self.history.epoch_metrics.update(epoch_logs)
-
-        return
-
-    def _train_batch(self, X):
-        """
-        Trains one batch of data
-
-        Parameters
-        ----------
-        X : torch.Tensor
-            Train matrix
-
-        Returns
-        -------
-        batch_outs : dict
-            Dictionnary with "y": target and "score": prediction scores.
-        batch_logs : dict
-            Dictionnary with "batch_size" and "loss".
-        """
-        batch_logs = {"batch_size": X.shape[0]}
-
-        X = X.to(self.device).float()
-
-        for param in self.network.parameters():
-            param.grad = None
-
-        output, embedded_x, obf_vars = self.network(X)
-        loss = self.compute_loss(output, embedded_x, obf_vars)
-
-        # Perform backward pass and optimization
-        loss.backward()
-        if self.clip_value:
-            clip_grad_norm_(self.network.parameters(), self.clip_value)
-        self._optimizer.step()
-
-        batch_logs["loss"] = loss.cpu().detach().numpy().item()
-
-        return batch_logs
-
-    def _predict_epoch(self, name, loader):
-        """
-        Predict an epoch and update metrics.
-
-        Parameters
-        ----------
-        name : str
-            Name of the validation set
-        loader : torch.utils.data.Dataloader
-                DataLoader with validation set
-        """
-        # Setting network on evaluation mode
-        self.network.eval()
-
-        list_output = []
-        list_embedded_x = []
-        list_obfuscation = []
-        # Main loop
-        for batch_idx, X in enumerate(loader):
-            output, embedded_x, obf_vars = self._predict_batch(X)
-            list_output.append(output.cpu().detach().numpy())
-            list_embedded_x.append(embedded_x.cpu().detach().numpy())
-            list_obfuscation.append(obf_vars.cpu().detach().numpy())
-
-        output, embedded_x, obf_vars = self.stack_batches(
-            list_output, list_embedded_x, list_obfuscation
-        )
-
-        metrics_logs = self._metric_container_dict[name](output, embedded_x, obf_vars)
-        self.network.train()
-        self.history.epoch_metrics.update(metrics_logs)
-        return
+    def _callback_container(self):
+        pass
 
     def _predict_batch(self, X):
         """
