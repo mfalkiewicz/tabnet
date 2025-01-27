@@ -7,6 +7,7 @@ Use pytorch_tabnet.spark.SparkDataset and pytorch_tabnet.spark.create_spark_load
 import warnings
 from typing import List, Optional
 import numpy as np
+import torch
 
 from pyspark.sql import DataFrame
 
