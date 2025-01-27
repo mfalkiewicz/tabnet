@@ -317,7 +317,7 @@ class TabNetClassifier(TabModel):
 
     def explain(
         self, X: Union[np.ndarray, DataFrame], normalize: bool = True
-    ) -> Tuple[NDArray[np.float32], Dict[str, NDArray[np.float32]]]:
+    ) -> NDArray[np.float32]:
         """Generate explanations for the model's predictions"""
         self.network.eval()
 
@@ -340,57 +340,33 @@ class TabNetClassifier(TabModel):
             )
 
         res_explain: List[NDArray[np.float32]] = []
-        masks_dict: Dict[str, List[NDArray[np.float32]]] = {}
 
         for _, data in enumerate(dataloader):
             data = data.to(self.device).float()
-            M_explain, masks = self.network.forward_masks(data)
+            M_explain, _ = self.network.forward_masks(data)
             res_explain.append(M_explain.cpu().detach().numpy())
 
-            # Initialize mask lists in dictionary if not already done
-            if not masks_dict:
-                masks_dict = {key: [] for key in masks.keys()}
-
-            # Append each mask to its corresponding list
-            for key, mask in masks.items():
-                masks_dict[key].append(mask.cpu().detach().numpy())
-
         res_explain_array = np.vstack(res_explain)
-
-        # Convert lists of masks to numpy arrays
-        final_masks = {
-            key: np.vstack(mask_list) for key, mask_list in masks_dict.items()
-        }
 
         if normalize:
             res_explain_array = (res_explain_array - res_explain_array.min()) / (
                 res_explain_array.max() - res_explain_array.min()
             )
 
-            for key in final_masks:
-                mask_array = final_masks[key]
-                final_masks[key] = (mask_array - mask_array.min()) / (
-                    mask_array.max() - mask_array.min()
-                )
-
-        return res_explain_array, final_masks
+        return res_explain_array
 
     def _set_output_dim(self, y):
         """Set output dimension based on y."""
         if len(y.shape) == 1:
-            self.output_dim = len(np.unique(y))
+            y_flat = y
         else:
-            if y.shape[1] == 1:
-                self.output_dim = len(np.unique(y))
-            else:
-                self.output_dim = y.shape[1]
-        self.classes_ = np.unique(y)
-        self.preds_mapper = None
+            y_flat = y.ravel() if y.shape[1] == 1 else y
 
-        if len(self.classes_) == 2:
-            self.preds_mapper = {0: self.classes_[0], 1: self.classes_[1]}
-        else:
-            self.preds_mapper = {idx: val for idx, val in enumerate(self.classes_)}
+        self.classes_ = np.unique(y_flat)
+        self.output_dim = len(self.classes_)
+        
+        # Always create preds_mapper
+        self.preds_mapper = {idx: val for idx, val in enumerate(self.classes_)}
 
     def _set_network(self):
         """Set the network architecture."""
@@ -522,6 +498,7 @@ class TabNetRegressor(TabModel):
         self._task = "regression"
         self._default_loss = torch.nn.functional.mse_loss
         self._default_metric = "mse"
+        self.preds_mapper = None  # Initialize preds_mapper
 
     def _prepare_input(
         self, X: Union[DataFrame, np.ndarray], target_col: Optional[str] = None

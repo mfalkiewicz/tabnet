@@ -840,13 +840,14 @@ class TabModel(BaseEstimator):
 
         Parameters
         ----------
-        loader : `torch.utils.data.Dataloader`
-            Pytorch dataloader.
+        X : Union[np.ndarray, DataFrame]
+            Input data.
 
         """
-        M_explain, _ = self.explain(X, normalize=False)
+        M_explain = self.explain(X, normalize=False)
         sum_explain = M_explain.sum(axis=0)
         feature_importances_ = sum_explain / np.sum(sum_explain)
+        return feature_importances_
         return feature_importances_
 
     def _update_network_params(self):
