@@ -42,7 +42,7 @@ try:
     _HAVE_PYSPARK = True
 except ImportError:
     _HAVE_PYSPARK = False
-from .spark_utils import SparkDataset
+from .spark_utils import SparkDataset, SparkCompatibility
 
 
 # Define the DataLoaderProtocol
