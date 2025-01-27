@@ -15,12 +15,16 @@ class SparkCompatibility:
     
     @staticmethod
     def extract_masks(explanation):
-        """Universal mask extraction for Spark/native formats"""
-        if isinstance(explanation, tuple):  # Spark tuple format
-            return explanation[0].numpy()  # Distributed Spark explanation
-        if isinstance(explanation, np.ndarray): 
-            return explanation
-        raise ValueError(f"Unknown explanation format: {type(explanation)}")
+        """Handle both PyTorch tensors and numpy arrays"""
+        if isinstance(explanation, tuple):
+            # Unpack Spark tuple format
+            masks = explanation[0]
+            if isinstance(masks, torch.Tensor):
+                return masks.detach().cpu().numpy()
+            return masks
+        elif isinstance(explanation, (torch.Tensor, np.ndarray)):
+            return explanation.detach().cpu().numpy() if isinstance(explanation, torch.Tensor) else explanation
+        return explanation
 from pytorch_tabnet.spark.provider import SparkDataset as NewSparkDataset
 from pytorch_tabnet.spark.provider import create_spark_loader as new_spark_data_loader
 from pytorch_tabnet.typing import DataLoaderProtocol

@@ -369,11 +369,16 @@ class TabNetClassifier(TabModel):
         self.preds_mapper = {idx: val for idx, val in enumerate(self.classes_)}
 
     def _set_network(self):
-        """Ensure binary classification uses 2 output units"""
-        if hasattr(self, 'classes_') and len(self.classes_) == 2:
-            self.output_dim = 2  # Force logits for binary classification
-            
-        super()._set_network()  # Now the network will build properly
+        """Ensure proper output dimensions based on class labels"""
+        # Set output_dim first based on available information
+        if hasattr(self, 'classes_') and self.classes_ is not None:
+            self.output_dim = len(self.classes_)
+        else:
+            # Default to 2 for binary case if classes not initialized
+            self.output_dim = 2 if self._task == "classification" else 1
+        
+        # Now call parent network initialization
+        super()._set_network()
 
         self.reducing_matrix = create_explain_matrix(
             self.network.input_dim,
