@@ -467,7 +467,7 @@ class TabModel(BaseEstimator):
         return f"{base_path}.zip"
 
     def load_model(self, filepath):
-        """Load TabNet model.
+        """Load TabNet model with validation.
 
         Parameters
         ----------
@@ -495,6 +495,11 @@ class TabModel(BaseEstimator):
 
         self.__init__(**loaded_params["init_params"])
 
+        # Validate critical dimensions
+        if self.input_dim is None or self.output_dim is None:
+            raise ValueError("Critical dimensions missing in loaded model")
+            
+        # Rebuild network using validated dimensions
         self._set_network()
         self.network.load_state_dict(saved_state_dict)
         self.network.eval()
@@ -836,19 +841,13 @@ class TabModel(BaseEstimator):
             )
 
     def _compute_feature_importances(self, X):
-        """Compute global feature importance.
-
-        Parameters
-        ----------
-        X : Union[np.ndarray, DataFrame]
-            Input data.
-
-        """
-        M_explain = self.explain(X, normalize=False)
-        sum_explain = M_explain.sum(axis=0)
-        feature_importances_ = sum_explain / np.sum(sum_explain)
-        return feature_importances_
-        return feature_importances_
+        """Handle Spark/native explanation formats uniformly"""
+        explain_result = self.explain(X, normalize=False)
+        
+        # Extract proper array for Spark vs local explanations
+        masks = SparkCompatibility.extract_masks(explain_result)
+        
+        return masks.mean(axis=0)
 
     def _update_network_params(self):
         self.network.virtual_batch_size = self.virtual_batch_size

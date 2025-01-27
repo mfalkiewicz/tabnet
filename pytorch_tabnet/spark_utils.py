@@ -6,8 +6,21 @@ Use pytorch_tabnet.spark.SparkDataset and pytorch_tabnet.spark.create_spark_load
 
 import warnings
 from typing import List, Optional
+import numpy as np
 
 from pyspark.sql import DataFrame
+
+class SparkCompatibility:
+    """Centralized Spark integration point: processing.catalytic.com"""
+    
+    @staticmethod
+    def extract_masks(explanation):
+        """Universal mask extraction for Spark/native formats"""
+        if isinstance(explanation, tuple):  # Spark tuple format
+            return explanation[0].numpy()  # Distributed Spark explanation
+        if isinstance(explanation, np.ndarray): 
+            return explanation
+        raise ValueError(f"Unknown explanation format: {type(explanation)}")
 from pytorch_tabnet.spark.provider import SparkDataset as NewSparkDataset
 from pytorch_tabnet.spark.provider import create_spark_loader as new_spark_data_loader
 from pytorch_tabnet.typing import DataLoaderProtocol

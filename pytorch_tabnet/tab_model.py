@@ -369,27 +369,11 @@ class TabNetClassifier(TabModel):
         self.preds_mapper = {idx: val for idx, val in enumerate(self.classes_)}
 
     def _set_network(self):
-        """Set the network architecture."""
-        output_dim = self.output_dim
-        if output_dim == 2:
-            # For binary classification, we need 2 output neurons
-            output_dim = 2
+        """Ensure binary classification uses 2 output units"""
+        if hasattr(self, 'classes_') and len(self.classes_) == 2:
+            self.output_dim = 2  # Force logits for binary classification
             
-        self.network = TabNet(
-            input_dim=self.input_dim,
-            output_dim=output_dim,  # Use the adjusted output_dim
-            n_d=self.n_d,
-            n_a=self.n_a,
-            n_steps=self.n_steps,
-            gamma=self.gamma,
-            n_independent=self.n_independent,
-            n_shared=self.n_shared,
-            epsilon=self.epsilon,
-            virtual_batch_size=self.virtual_batch_size,
-            momentum=self.momentum,
-            mask_type=self.mask_type,
-            group_attention_matrix=self.group_attention_matrix,
-        ).to(self.device)
+        super()._set_network()  # Now the network will build properly
 
         self.reducing_matrix = create_explain_matrix(
             self.network.input_dim,
