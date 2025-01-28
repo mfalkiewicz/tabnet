@@ -578,14 +578,17 @@ class TabModel(BaseEstimator):
         except KeyError:
             raise KeyError("Your zip file is missing at least one component")
 
+        # Initialize with saved parameters
         self.__init__(**loaded_params["init_params"])
 
-        # Validate critical dimensions
+        # Validate critical dimensions and classes
         if self.input_dim is None or self.output_dim is None:
             raise ValueError("Critical dimensions missing in loaded model")
+        if not hasattr(self, 'classes_') or len(self.classes_) != self.output_dim:
+            raise ValueError("Classes information missing or invalid in loaded model")
             
-        # Rebuild network using validated dimensions
-        self._set_network()
+        # Force network re-initialization and load saved state
+        self._initialize_network()
         self.network.load_state_dict(saved_state_dict)
         self.network.eval()
         self.load_class_attrs(loaded_params["class_attrs"])
@@ -913,10 +916,14 @@ class TabModel(BaseEstimator):
             Prepared input data
         """
         if isinstance(X, np.ndarray):
-            if len(X.shape) == 1:
-                raise ValueError("Expected 2D array, got 1D array instead")
+            if len(X.shape) != 2:
+                raise ValueError(f"Expected 2D array, got {len(X.shape)}D array instead")
             if not np.all(np.isfinite(X)):
-                raise ValueError("Input contains NaN or Inf values")
+                raise ValueError("Input contains NaN, Inf or -Inf values")
+            if X.shape[1] == 0:
+                raise ValueError("Input has 0 features")
+            if X.shape[0] == 0:
+                raise ValueError("Input has 0 samples")
             self.input_dim = X.shape[1]
             return X
         elif _HAVE_PYSPARK and isinstance(X, DataFrame):

@@ -378,8 +378,11 @@ class TabNetClassifier(TabModel):
             y_flat = y.ravel() if y.shape[1] == 1 else y
 
         self.classes_ = np.unique(y_flat)
+        # For classification, output_dim must match number of classes
         self.output_dim = len(self.classes_)
-        
+        if self.output_dim < 2:
+            raise ValueError("Need at least 2 classes for classification")
+            
         # Always create preds_mapper
         self.preds_mapper = {idx: val for idx, val in enumerate(self.classes_)}
 
@@ -387,14 +390,17 @@ class TabNetClassifier(TabModel):
         """Initialize the network."""
         if self.input_dim is None:
             raise ValueError("Input dimension must be set before initializing network")
-
-        # Set output dimension if not already set
         if self.output_dim is None:
-            if hasattr(self, 'classes_') and self.classes_ is not None:
-                self.output_dim = len(self.classes_)
-            else:
-                raise ValueError("Output dimension not set and no classes found")
+            raise ValueError("Output dimension must be set before initializing network")
+            
+        # For classification, output_dim must match number of classes
+        if not hasattr(self, 'classes_') or len(self.classes_) != self.output_dim:
+            raise ValueError(f"Output dimension {self.output_dim} does not match number of classes {len(self.classes_) if hasattr(self, 'classes_') else 'unknown'}")
 
+        # Force network re-initialization
+        if hasattr(self, 'network'):
+            del self.network
+            
         self._set_network()
         # For both binary and multiclass classification, use Softmax
         self.predict_func = torch.nn.Softmax(dim=1)
