@@ -141,8 +141,10 @@ def test_binary_classification_numpy(binary_classification_data):
     assert np.all(feat_imp >= 0)
 
     # Test explain
-    explain_matrix = clf.explain(X_test[:10])
+    explain_matrix, masks = clf.explain(X_test[:10])
     assert explain_matrix.shape == (10, X_test.shape[1])
+    assert isinstance(masks, dict)
+    assert all(isinstance(v, np.ndarray) for v in masks.values())
 
 
 def test_multiclass_classification_numpy(multiclass_classification_data):

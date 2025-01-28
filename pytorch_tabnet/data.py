@@ -1,6 +1,12 @@
 from typing import Iterator, Tuple, Optional
 import torch
 from torch.utils.data import IterableDataset
+from pytorch_tabnet.dataframe import (
+    TabNetDataFrame,
+    PandasDataFrame,
+    PolarsDataFrame,
+    SparkDataFrame
+)
 
 class TabularDataBatch:
     """Represents a batch of tabular data (features and optional targets)"""

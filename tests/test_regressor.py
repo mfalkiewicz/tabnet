@@ -277,8 +277,10 @@ def test_regressor_feature_selection(regression_data):
     assert np.sum(feat_imp) > 0
 
     # Test explain matrix
-    explain_matrix = reg.explain(X_test)
+    explain_matrix, masks = reg.explain(X_test)
     assert explain_matrix.shape == (len(X_test), len(feature_names))
+    assert isinstance(masks, dict)
+    assert all(isinstance(v, np.ndarray) for v in masks.values())
     assert np.all(explain_matrix >= 0)
     assert np.all(explain_matrix <= 1)
 
