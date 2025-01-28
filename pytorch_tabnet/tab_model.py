@@ -160,9 +160,17 @@ class TabNetClassifier(TabModel):
         if X_train.shape[0] != y_train.shape[0]:
             raise ValueError(f"X_train and y_train have different number of samples: {X_train.shape[0]} vs {y_train.shape[0]}")
 
+        # Determine number of unique classes
+        if len(y_train.shape) == 1 or y_train.shape[1] == 1:
+            self.classes_ = np.unique(y_train)
+            n_classes = len(self.classes_)
+        else:
+            self.classes_ = np.arange(y_train.shape[1])
+            n_classes = y_train.shape[1]
+
         updated_params = {
             "input_dim": X_train.shape[1],
-            "output_dim": y_train.shape[1] if len(y_train.shape) > 1 else 1,
+            "output_dim": n_classes,
             "weights": weights
         }
 
@@ -317,7 +325,7 @@ class TabNetClassifier(TabModel):
 
     def explain(
         self, X: Union[np.ndarray, DataFrame], normalize: bool = True
-    ) -> NDArray[np.float32]:
+    ) -> Tuple[NDArray[np.float32], Dict[str, NDArray[np.float32]]]:
         """Generate explanations for the model's predictions"""
         self.network.eval()
 
@@ -340,20 +348,33 @@ class TabNetClassifier(TabModel):
             )
 
         res_explain: List[NDArray[np.float32]] = []
+        res_masks = {}
 
         for _, data in enumerate(dataloader):
             data = data.to(self.device).float()
-            M_explain, _ = self.network.forward_masks(data)
+            M_explain, masks = self.network.forward_masks(data)
             res_explain.append(M_explain.cpu().detach().numpy())
+            
+            # Initialize res_masks on first batch
+            if not res_masks:
+                res_masks = {k: [] for k in masks.keys()}
+                
+            # Append each mask
+            for k, v in masks.items():
+                res_masks[k].append(v.cpu().detach().numpy())
 
         res_explain_array = np.vstack(res_explain)
+        
+        # Stack all masks
+        for k in res_masks.keys():
+            res_masks[k] = np.vstack(res_masks[k])
 
         if normalize:
             res_explain_array = (res_explain_array - res_explain_array.min()) / (
                 res_explain_array.max() - res_explain_array.min()
             )
 
-        return res_explain_array
+        return res_explain_array, res_masks
 
     def _set_output_dim(self, y):
         """Set output dimension based on y."""
@@ -368,36 +389,18 @@ class TabNetClassifier(TabModel):
         # Always create preds_mapper
         self.preds_mapper = {idx: val for idx, val in enumerate(self.classes_)}
 
-    def _set_network(self):
-        """Ensure proper output dimensions based on class labels"""
-        # Set output_dim first based on available information
-        if hasattr(self, 'classes_') and self.classes_ is not None:
-            self.output_dim = len(self.classes_)
-        else:
-            # Default to 2 for binary case if classes not initialized
-            self.output_dim = 2 if self._task == "classification" else 1
-        
-        # Now call parent network initialization
-        super()._set_network()
-
-        self.reducing_matrix = create_explain_matrix(
-            self.network.input_dim,
-            self.network.cat_emb_dim,
-            self.network.cat_idxs,
-            self.network.post_embed_dim
-        )
-
-        self.explain_matrix = create_explain_matrix(
-            self.network.input_dim,
-            self.network.cat_emb_dim,
-            self.network.cat_idxs,
-            self.network.post_embed_dim
-        )
-
     def _initialize_network(self) -> None:
         """Initialize the network."""
-        if self.input_dim is None or self.output_dim is None:
-            raise ValueError("Input and output dimensions must be set before initializing network")
+        if self.input_dim is None:
+            raise ValueError("Input dimension must be set before initializing network")
+
+        # Set output dimension if not already set
+        if self.output_dim is None:
+            if hasattr(self, 'classes_') and self.classes_ is not None:
+                self.output_dim = len(self.classes_)
+            else:
+                # Default to 2 for binary case if classes not initialized
+                self.output_dim = 2
 
         self._set_network()
         # For both binary and multiclass classification, use Softmax
@@ -513,59 +516,6 @@ class TabNetRegressor(TabModel):
         else:
             return super()._prepare_input(X)
 
-    def update_fit_params(
-        self,
-        X_train,
-        y_train,
-        eval_set,
-        weights,
-    ):
-        """
-        Update fit parameters based on input data
-
-        Parameters
-        ----------
-        X_train : np.ndarray or pd.DataFrame or torch.Tensor
-            Training data
-        y_train : np.ndarray or pd.DataFrame or torch.Tensor
-            Target values
-        eval_set : list of tuples
-            List of (X, y) tuple pairs for evaluation
-        weights : np.ndarray or None
-            Sample weights
-
-        Returns
-        -------
-        dict
-            Updated fit parameters
-        """
-        # Check input shapes and types
-        if isinstance(X_train, pd.DataFrame):
-            X_train = X_train.values
-        elif isinstance(X_train, torch.Tensor):
-            X_train = X_train.cpu().numpy()
-            
-        if len(X_train.shape) != 2:
-            raise ValueError(f"Expected 2D input array, got shape {X_train.shape}")
-            
-        if isinstance(y_train, pd.DataFrame):
-            y_train = y_train.values
-        elif isinstance(y_train, torch.Tensor):
-            y_train = y_train.cpu().numpy()
-            
-        if len(y_train.shape) == 1:
-            y_train = y_train.reshape(-1, 1)
-            
-        if X_train.shape[0] != y_train.shape[0]:
-            raise ValueError(f"X_train and y_train have different number of samples: {X_train.shape[0]} vs {y_train.shape[0]}")
-
-        updated_params = {
-            "input_dim": X_train.shape[1],
-            "output_dim": y_train.shape[1] if len(y_train.shape) > 1 else 1,
-            "weights": weights
-        }
-
-        return updated_params
 
     def prepare_target(self, y):
         """Prepare target data.

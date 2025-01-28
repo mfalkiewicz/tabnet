@@ -6,6 +6,9 @@ import numpy as np
 from scipy.sparse import csc_matrix
 from abc import abstractmethod
 from pytorch_tabnet import tab_network
+from pytorch_tabnet.model_state import ModelState
+from pytorch_tabnet.validation import InputValidator, ModelOutputs
+from pytorch_tabnet.resource import ResourceManager, MemoryManager, ResourceContext
 from pytorch_tabnet.utils import (
     SparsePredictDataset,
     PredictDataset,
@@ -83,24 +86,51 @@ class TabModel(BaseEstimator):
     grouped_features: List[List[int]] = field(default_factory=list)
 
     def __post_init__(self):
+        # Initialize state management
+        self._state = ModelState()
+        self._validator = InputValidator()
+        self._resource_manager = ResourceManager()
+        self._memory_manager = MemoryManager()
+
         # These are default values needed for saving model
         self.batch_size = 1024
         self.virtual_batch_size = 128
 
+        # Set random seed
         torch.manual_seed(self.seed)
-        # Defining device
+        
+        # Initialize device
         self.device = torch.device(define_device(self.device_name))
+        self._state.update(device=self.device)
         if self.verbose != 0:
             warnings.warn(f"Device used : {self.device}")
 
-        # create deep copies of mutable parameters
+        # Create deep copies of mutable parameters
         self.optimizer_fn = copy.deepcopy(self.optimizer_fn)
         self.scheduler_fn = copy.deepcopy(self.scheduler_fn)
 
+        # Validate and update embedding parameters
         updated_params = check_embedding_parameters(
             self.cat_dims, self.cat_idxs, self.cat_emb_dim
         )
         self.cat_dims, self.cat_idxs, self.cat_emb_dim = updated_params
+
+        # Initialize state tracking
+        self._state.update(
+            initialized=True,
+            input_dim=self.input_dim,
+            output_dim=self.output_dim
+        )
+
+        # Set input dimension if provided during initialization
+        if self.input_dim is not None:
+            self._state.update(input_dim=self.input_dim)
+            self._prepare_model()
+
+    def _prepare_model(self):
+        """Prepare model if input dimension is known."""
+        if self.input_dim is not None:
+            self._set_network()
 
     def __update__(self, **kwargs):
         """
@@ -161,141 +191,145 @@ class TabModel(BaseEstimator):
 
         Parameters
         ----------
-        X_train : np.ndarray
-            Train set
-        y_train : np.array
-            Train targets
-        eval_set : list of tuple
-            List of eval tuple set (X, y).
-            The last one is used for early stopping
-        eval_name : list of str
-            List of eval set names.
-        eval_metric : list of str
-            List of evaluation metrics.
-            The last metric is used for early stopping.
-        loss_fn : callable or None
-            a PyTorch loss function
-        weights : bool or dictionnary
-            0 for no balancing
-            1 for automated balancing
-            dict for custom weights per class
-        max_epochs : int
-            Maximum number of epochs during training
-        patience : int
-            Number of consecutive non improving epoch before early stopping
-        batch_size : int
-            Training batch size
-        virtual_batch_size : int
-            Batch size for Ghost Batch Normalization (virtual_batch_size < batch_size)
-        num_workers : int
-            Number of workers used in torch.utils.data.DataLoader
-        drop_last : bool
-            Whether to drop last batch during training
-        callbacks : list of callback function
-            List of custom callbacks
-        pin_memory: bool
-            Whether to set pin_memory to True or False during training
-        from_unsupervised: unsupervised trained model
-            Use a previously self supervised model as starting weights
-        warm_start: bool
-            If True, current model parameters are used to start training
-        compute_importance : bool
-            Whether to compute feature importance
-        from_epoch : int
-            Start training from this epoch
+        [parameters remain unchanged]
 
         Returns
         -------
         self : object
             Returns self.
         """
-        # update model name
+        with ResourceContext(self._memory_manager):
+            # Validate inputs
+            self._validator.validate_dimensions(X_train, y_train)
+            self._validator.validate_types(X_train, y_train)
 
-        self.max_epochs = max_epochs
-        self.patience = patience
-        self.batch_size = batch_size
-        self.virtual_batch_size = virtual_batch_size
-        self.num_workers = num_workers
-        self.drop_last = drop_last
-        self.input_dim = X_train.shape[1]
-        self._stop_training = False
-        self.pin_memory = pin_memory and (self.device.type != "cpu")
-        self.augmentations = augmentations
-        self.compute_importance = compute_importance
-        self.from_epoch = from_epoch
+            # Update training parameters
+            self.max_epochs = max_epochs
+            self.patience = patience
+            self.batch_size = batch_size
+            self.virtual_batch_size = virtual_batch_size
+            self.num_workers = num_workers
+            self.drop_last = drop_last
+            
+            # Set input dimension based on data type
+            if isinstance(X_train, np.ndarray):
+                self.input_dim = X_train.shape[1]
+            elif _HAVE_PYSPARK and isinstance(X_train, DataFrame):
+                self.input_dim = len(X_train.columns)
+                if self.target_col:
+                    self.input_dim -= 1  # Exclude target column from input dimension
+            else:
+                self.input_dim = len(X_train.columns)
+                
+            self._stop_training = False
+            self.pin_memory = pin_memory and (self.device.type != "cpu")
+            self.augmentations = augmentations
+            self.compute_importance = compute_importance
+            self.from_epoch = from_epoch
 
-        if self.augmentations is not None:
-            # This ensure reproducibility
-            self.augmentations._set_seed()
+            # Set dimensions based on data type
+            if isinstance(X_train, np.ndarray):
+                self.input_dim = X_train.shape[1]
+            elif _HAVE_PYSPARK and isinstance(X_train, DataFrame):
+                self.input_dim = len(X_train.columns)
+                if self.target_col:
+                    self.input_dim -= 1  # Exclude target column from input dimension
+            else:
+                self.input_dim = len(X_train.columns)
 
-        eval_set = eval_set if eval_set else []
+            # Set output dimension based on target
+            if isinstance(y_train, np.ndarray):
+                self.output_dim = y_train.shape[1] if len(y_train.shape) > 1 else 1
+            elif _HAVE_PYSPARK and isinstance(y_train, str):
+                self.output_dim = 1  # Single target column for Spark
+            else:
+                self.output_dim = 1  # Default to single output
 
-        if loss_fn is None:
-            self.loss_fn = self._default_loss
-        else:
-            self.loss_fn = loss_fn
+            # Update state and prepare model
+            self._state.update(
+                input_dim=self.input_dim,
+                output_dim=self.output_dim,
+                training=True,
+                current_epoch=from_epoch
+            )
+            self._prepare_model()
+            
+            # Validate model state after preparation
+            self._state.validate()
 
-        check_input(X_train)
-        check_warm_start(warm_start, from_unsupervised)
+            if self.augmentations is not None:
+                self.augmentations._set_seed()
 
-        self.update_fit_params(
-            X_train,
-            y_train,
-            eval_set,
-            weights,
-        )
+            eval_set = eval_set if eval_set else []
 
-        # Validate and reformat eval set depending on training data
-        eval_names, eval_set = validate_eval_set(eval_set, eval_name, X_train, y_train)
+            if loss_fn is None:
+                self.loss_fn = self._default_loss
+            else:
+                self.loss_fn = loss_fn
 
-        train_dataloader, valid_dataloaders = self._construct_loaders(
-            X_train, y_train, eval_set
-        )
+            check_warm_start(warm_start, from_unsupervised)
 
-        if from_unsupervised is not None:
-            # Update parameters to match self pretraining
-            self.__update__(**from_unsupervised.get_params())
-
-        if not hasattr(self, "network") or not warm_start:
-            # model has never been fitted before of warm_start is False
-            self._set_network()
-        self._update_network_params()
-        self._set_metrics(eval_metric, eval_names)
-        self._set_optimizer()
-        self._set_callbacks(callbacks)
-
-        if from_unsupervised is not None:
-            self.load_weights_from_unsupervised(from_unsupervised)
-            warnings.warn("Loading weights from unsupervised pretraining")
-        # Call method on_train_begin for all callbacks
-        self._callback_container.on_train_begin()
-
-        # Training loop over epochs
-        for epoch_idx in range(self.from_epoch, self.max_epochs):
-            # Call method on_epoch_begin for all callbacks
-            self._callback_container.on_epoch_begin(epoch_idx)
-
-            self._train_epoch(train_dataloader)
-
-            # Apply predict epoch to all eval sets
-            for eval_name, valid_dataloader in zip(eval_names, valid_dataloaders):
-                self._predict_epoch(eval_name, valid_dataloader)
-
-            # Call method on_epoch_end for all callbacks
-            self._callback_container.on_epoch_end(
-                epoch_idx, logs=self.history.epoch_metrics
+            self.update_fit_params(
+                X_train,
+                y_train,
+                eval_set,
+                weights,
             )
 
-            if self._stop_training:
-                break
+            # Validate and reformat eval set
+            eval_names, eval_set = validate_eval_set(eval_set, eval_name, X_train, y_train)
 
-        # Call method on_train_end for all callbacks
-        self._callback_container.on_train_end()
-        self.network.eval()
+            # Construct data loaders
+            train_dataloader, valid_dataloaders = self._construct_loaders(
+                X_train, y_train, eval_set
+            )
 
-        if self.compute_importance:
-            # compute feature importance once the best model is defined
-            self.feature_importances_ = self._compute_feature_importances(X_train)
+            if from_unsupervised is not None:
+                self.__update__(**from_unsupervised.get_params())
+
+            # Initialize or update network
+            if not hasattr(self, "network") or not warm_start:
+                self._set_network()
+            self._update_network_params()
+            self._set_metrics(eval_metric, eval_names)
+            self._set_optimizer()
+            self._set_callbacks(callbacks)
+
+            if from_unsupervised is not None:
+                self.load_weights_from_unsupervised(from_unsupervised)
+                warnings.warn("Loading weights from unsupervised pretraining")
+
+            # Training loop
+            self._callback_container.on_train_begin()
+
+            for epoch_idx in range(self.from_epoch, self.max_epochs):
+                self._state.update(current_epoch=epoch_idx)
+                self._callback_container.on_epoch_begin(epoch_idx)
+                
+                # Check memory before training epoch
+                self._memory_manager.check_memory()
+                
+                self._train_epoch(train_dataloader)
+
+                for eval_name, valid_dataloader in zip(eval_names, valid_dataloaders):
+                    self._predict_epoch(eval_name, valid_dataloader)
+
+                self._callback_container.on_epoch_end(
+                    epoch_idx, logs=self.history.epoch_metrics
+                )
+
+                if self._stop_training:
+                    break
+
+            self._callback_container.on_train_end()
+            self.network.eval()
+            self._state.update(training=False)
+
+            if self.compute_importance:
+                self.feature_importances_ = self._compute_feature_importances(X_train)
+
+            # Final cleanup
+            self._memory_manager.check_memory()
 
     def predict(self, X):
         """
@@ -308,34 +342,47 @@ class TabModel(BaseEstimator):
 
         Returns
         -------
-        predictions : np.array
-            Predictions of the regression problem
+        ModelOutputs
+            Standardized model outputs containing predictions
         """
-        self.network.eval()
+        with ResourceContext(self._memory_manager):
+            # Validate model state and inputs
+            self._state.validate()
+            self._validator.validate_dimensions(X)
+            self._validator.validate_types(X)
+            
+            self.network.eval()
+            self._state.update(training=False)
 
-        if scipy.sparse.issparse(X):
-            dataloader = DataLoader(
-                SparsePredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
-        else:
-            dataloader = DataLoader(
-                PredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
+            if scipy.sparse.issparse(X):
+                dataloader = DataLoader(
+                    SparsePredictDataset(X),
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                )
+            else:
+                dataloader = DataLoader(
+                    PredictDataset(X),
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                )
 
-        results = []
-        for batch_nb, data in enumerate(dataloader):
-            data = data.to(self.device).float()
-            output, M_loss = self.network(data)
-            predictions = output.cpu().detach().numpy()
-            results.append(predictions)
-        res = np.vstack(results)
-        return self.predict_func(res)
+            results = []
+            for batch_nb, data in enumerate(dataloader):
+                # Check memory before each batch
+                self._memory_manager.check_memory()
+                
+                data = data.to(self.device).float()
+                output, M_loss = self.network(data)
+                predictions = output.cpu().detach().numpy()
+                results.append(predictions)
 
-    def explain(self, X, normalize=False):
+            res = np.vstack(results)
+            predictions = self.predict_func(res)
+            
+            return ModelOutputs(predictions=predictions)
+
+    def explain(self, X, normalize=True):
         """
         Return local explanation
 
@@ -343,8 +390,8 @@ class TabModel(BaseEstimator):
         ----------
         X : tensor: `torch.Tensor` or matrix: `scipy.sparse.csr_matrix`
             Input data
-        normalize : bool (default False)
-            Wheter to normalize so that sum of features are equal to 1
+        normalize : bool (default True)
+            Whether to normalize so that feature importances are between 0 and 1
 
         Returns
         -------
@@ -369,30 +416,36 @@ class TabModel(BaseEstimator):
             )
 
         res_explain = []
+        res_masks = {}
 
         for batch_nb, data in enumerate(dataloader):
             data = data.to(self.device).float()
 
             M_explain, masks = self.network.forward_masks(data)
+            
+            # Process masks
+            batch_masks = {}
             for key, value in masks.items():
-                masks[key] = csc_matrix.dot(
-                    value.cpu().detach().numpy(), self.reducing_matrix
-                )
-            original_feat_explain = csc_matrix.dot(
-                M_explain.cpu().detach().numpy(), self.reducing_matrix
-            )
+                mask_np = value.cpu().detach().numpy()
+                if normalize:
+                    mask_np = (mask_np - mask_np.min()) / (mask_np.max() - mask_np.min() + 1e-15)
+                batch_masks[key] = csc_matrix.dot(mask_np, self.reducing_matrix)
+            
+            # Process explanations
+            explain_np = M_explain.cpu().detach().numpy()
+            if normalize:
+                explain_np = (explain_np - explain_np.min()) / (explain_np.max() - explain_np.min() + 1e-15)
+            original_feat_explain = csc_matrix.dot(explain_np, self.reducing_matrix)
             res_explain.append(original_feat_explain)
 
+            # Initialize or update masks
             if batch_nb == 0:
-                res_masks = masks
+                res_masks = batch_masks
             else:
-                for key, value in masks.items():
+                for key, value in batch_masks.items():
                     res_masks[key] = np.vstack([res_masks[key], value])
 
         res_explain = np.vstack(res_explain)
-
-        if normalize:
-            res_explain /= np.sum(res_explain, axis=1)[:, None]
 
         return res_explain, res_masks
 
@@ -411,8 +464,23 @@ class TabModel(BaseEstimator):
         self.network.load_state_dict(update_state_dict)
 
     def load_class_attrs(self, class_attrs):
+        """Load class attributes and restore model state.
+
+        Parameters
+        ----------
+        class_attrs : dict
+            Dictionary containing class attributes and state information
+        """
+        # Restore class attributes
         for attr_name, attr_value in class_attrs.items():
             setattr(self, attr_name, attr_value)
+
+        # Update state with critical dimensions
+        self._state.update(
+            input_dim=self.input_dim,
+            output_dim=self.output_dim,
+            initialized=True
+        )
 
     def save_model(self, path):
         """Saving TabNet model in two distinct files.
@@ -436,9 +504,25 @@ class TabModel(BaseEstimator):
                 continue
             else:
                 init_params[key] = val
+        
+        # Save critical dimensions and state
+        init_params["input_dim"] = self.input_dim
+        init_params["output_dim"] = self.output_dim
+        
         saved_params["init_params"] = init_params
+        saved_params["state"] = {
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "initialized": self._state.initialized,
+            "training": self._state.training,
+            "current_epoch": getattr(self, "current_epoch", 0)
+        }
 
-        class_attrs = {"preds_mapper": self.preds_mapper}
+        class_attrs = {
+            "preds_mapper": self.preds_mapper,
+            "classes_": getattr(self, "classes_", None),
+            "feature_importances_": getattr(self, "feature_importances_", None)
+        }
         saved_params["class_attrs"] = class_attrs
 
         # Remove .zip extension if present and create a temporary directory
