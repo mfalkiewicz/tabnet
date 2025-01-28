@@ -223,9 +223,9 @@ class TabNetClassifier(TabModel):
         # Ensure y_true is properly formatted for CrossEntropyLoss
         y_true = y_true.long()
         
-        # Ensure y_score has the right shape (N, C) where C is number of classes
-        if len(y_score.shape) == 1 or y_score.shape[1] == 1:
-            y_score = torch.cat([-y_score, y_score], dim=1)
+        # Ensure y_score has shape (N, C) where C matches number of classes
+        if y_score.shape[1] != self.output_dim:
+            raise ValueError(f"Network output dimension {y_score.shape[1]} does not match expected {self.output_dim}")
             
         return self.loss_fn(y_score, y_true)
 
@@ -255,12 +255,6 @@ class TabNetClassifier(TabModel):
             data = data.to(self.device).float()
 
             output, _ = self.network(data)
-            
-            if self.output_dim == 2:
-                # For binary classification, ensure we have 2 outputs
-                if output.shape[1] == 1:
-                    output = torch.cat([-output, output], dim=1)
-            
             output = self.predict_func(output)
             results.append(output.cpu().detach().numpy())
             
@@ -399,8 +393,7 @@ class TabNetClassifier(TabModel):
             if hasattr(self, 'classes_') and self.classes_ is not None:
                 self.output_dim = len(self.classes_)
             else:
-                # Default to 2 for binary case if classes not initialized
-                self.output_dim = 2
+                raise ValueError("Output dimension not set and no classes found")
 
         self._set_network()
         # For both binary and multiclass classification, use Softmax

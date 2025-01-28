@@ -508,6 +508,7 @@ class TabModel(BaseEstimator):
         # Save critical dimensions and state
         init_params["input_dim"] = self.input_dim
         init_params["output_dim"] = self.output_dim
+        init_params["_task"] = getattr(self, "_task", None)
         
         saved_params["init_params"] = init_params
         saved_params["state"] = {
@@ -914,6 +915,8 @@ class TabModel(BaseEstimator):
         if isinstance(X, np.ndarray):
             if len(X.shape) == 1:
                 raise ValueError("Expected 2D array, got 1D array instead")
+            if not np.all(np.isfinite(X)):
+                raise ValueError("Input contains NaN or Inf values")
             self.input_dim = X.shape[1]
             return X
         elif _HAVE_PYSPARK and isinstance(X, DataFrame):
