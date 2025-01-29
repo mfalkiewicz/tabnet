@@ -708,7 +708,7 @@ def define_device(device_name: str) -> torch.device:
 
 
 class ComplexEncoder(json.JSONEncoder):
-    """JSON encoder that handles numpy arrays and other complex types."""
+    """JSON encoder that handles numpy types and arrays."""
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
@@ -716,6 +716,10 @@ class ComplexEncoder(json.JSONEncoder):
             return int(obj)
         if isinstance(obj, np.floating):
             return float(obj)
+        if isinstance(obj, dict):
+            # Convert dictionary keys to native Python types
+            return {(int(k) if isinstance(k, np.integer) else k): v
+                   for k, v in obj.items()}
         return super().default(obj)
 
 

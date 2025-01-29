@@ -94,14 +94,19 @@ class TabNetClassifier(TabModel):
         self.group_attention_matrix = None  # Initialize group_attention_matrix
         
     def save_model(self, path):
-        """Save model to file."""
+        """Save model to file with validation."""
+        # Validate model state before saving
+        self._validate_dimensions()
+        
         saved_params = {}
         init_params = {}
         
-        # Save only initialization parameters
+        # Save only initialization parameters with type conversion
         for key, val in self.get_params().items():
             if isinstance(val, type):
                 continue
+            if isinstance(key, np.integer):
+                key = int(key)
             init_params[key] = val
         
         # Save critical dimensions and state
@@ -110,14 +115,18 @@ class TabNetClassifier(TabModel):
         
         saved_params["init_params"] = init_params
         
-        # Save class attributes separately
+        # Convert numpy types in class attributes
         class_attrs = {
-            "preds_mapper": self.preds_mapper,
-            "classes_": self.classes_,
+            "preds_mapper": {int(k) if isinstance(k, np.integer) else k: v
+                           for k, v in (self.preds_mapper or {}).items()},
+            "classes_": self.classes_.tolist() if isinstance(self.classes_, np.ndarray) else self.classes_,
+            "_class_map": {int(k) if isinstance(k, np.integer) else k: int(v) if isinstance(v, np.integer) else v
+                          for k, v in (self._class_map or {}).items()},
             "feature_importances_": getattr(self, "feature_importances_", None),
-            "_task": self._task,  # Save _task as class attribute
-            "input_dim": self.input_dim,  # Save dimensions in both places to ensure they're preserved
-            "output_dim": self.output_dim
+            "_task": self._task,
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "version": "1.0.0"
         }
         saved_params["class_attrs"] = class_attrs
         
@@ -129,10 +138,18 @@ class TabNetClassifier(TabModel):
         
         Path(temp_dir).mkdir(parents=True, exist_ok=True)
         
+        # Save model parameters
         with open(Path(temp_dir).joinpath("model_params.json"), "w", encoding="utf8") as f:
             json.dump(saved_params, f, cls=ComplexEncoder)
             
-        torch.save(self.network.state_dict(), Path(temp_dir).joinpath("network.pt"))
+        # Save network state with full state dict
+        torch.save({
+            'state_dict': self.network.state_dict(),
+            'input_dim': self.input_dim,
+            'output_dim': self.output_dim,
+            'classes_': self.classes_,
+            'preds_mapper': self.preds_mapper
+        }, Path(temp_dir).joinpath("network.pt"))
         
         shutil.make_archive(base_path, "zip", temp_dir)
         shutil.rmtree(temp_dir)
@@ -274,7 +291,7 @@ class TabNetClassifier(TabModel):
         return updated_params
 
     def prepare_target(self, y):
-        """Prepare target data.
+        """Prepare target data with class preservation.
 
         Parameters
         ----------
@@ -286,6 +303,7 @@ class TabNetClassifier(TabModel):
         array-like
             Prepared target data
         """
+        # Convert input to numpy array
         if isinstance(y, pd.DataFrame):
             y = y.values
         elif isinstance(y, torch.Tensor):
@@ -294,29 +312,32 @@ class TabNetClassifier(TabModel):
         if len(y.shape) == 1:
             y = y.reshape(-1, 1)
             
-        # Initialize class mapping if not already done
-        if not hasattr(self, '_class_map'):
-            unique_classes = np.unique(y.ravel())
-            if len(unique_classes) < 2:
-                raise ValueError("Need at least 2 classes for classification")
+        # Validate before any transformations
+        unique_classes = np.unique(y.ravel())
+        if len(unique_classes) < 2:
+            raise ValueError("Need at least 2 classes for classification")
                 
-            # Create mapping from original classes to 0-based indices
-            self._class_map = {val: idx for idx, val in enumerate(unique_classes)}
-            self.preds_mapper = {idx: val for idx, val in enumerate(unique_classes)}
-            self.classes_ = unique_classes
+        # Store original classes for validation
+        self.original_classes_ = unique_classes
+                
+        # Update class information
+        self.classes_ = unique_classes
+        self._class_map = {val: idx for idx, val in enumerate(unique_classes)}
+        self.preds_mapper = {idx: val for idx, val in enumerate(unique_classes)}
             
-            # Set output dimension based on number of classes
-            self.output_dim = len(unique_classes)
+        # Use centralized dimension management
+        self._set_dimensions()
             
-            # Initialize network with correct output dimension if needed
-            if hasattr(self, 'network') and self.network is not None:
-                self._initialize_network()
-            
-        # Map classes to 0-based indices
+        # Map classes to 0-based indices while preserving all classes
         if len(y.shape) == 1:
             y = np.array([self._class_map[val] for val in y])
         else:
             y = np.array([self._class_map[val] for val in y.ravel()]).reshape(y.shape)
+            
+        # Validate class preservation
+        mapped_classes = np.unique(y)
+        if len(mapped_classes) != len(self.original_classes_):
+            raise ValueError("Class information was lost during target preparation")
             
         return y
     def compute_loss(self, y_score: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -511,6 +532,28 @@ class TabNetClassifier(TabModel):
 
         return res_explain_array, res_masks
 
+    def _set_dimensions(self):
+        """Single source of truth for setting dimensions"""
+        if not hasattr(self, 'classes_'):
+            raise ValueError("Classes must be determined before setting dimensions")
+        if self.input_dim is None:
+            raise ValueError("Input dimension must be set before setting dimensions")
+            
+        # Set output dimension based on number of classes
+        self.output_dim = len(self.classes_)
+        self._validate_dimensions()
+
+    def _validate_dimensions(self):
+        """Validate dimensions are properly set"""
+        if self.input_dim is None:
+            raise ValueError("Input dimension is not set")
+        if self.output_dim is None:
+            raise ValueError("Output dimension is not set")
+        if self.output_dim < 2:
+            raise ValueError("Output dimension must be at least 2 for classification")
+        if not hasattr(self, 'classes_') or len(self.classes_) != self.output_dim:
+            raise ValueError("Number of classes does not match output dimension")
+
     def _set_output_dim(self, y):
         """Set output dimension based on y."""
         if len(y.shape) == 1:
@@ -527,32 +570,80 @@ class TabNetClassifier(TabModel):
         self._class_map = {val: idx for idx, val in enumerate(self.classes_)}
         self.preds_mapper = {idx: val for idx, val in enumerate(self.classes_)}
         
-        # Set output dimension to match number of classes
-        # For both binary and multiclass, output_dim should match number of classes
-        self.output_dim = len(self.classes_)
+        # Use centralized dimension setting
+        self._set_dimensions()
+
+    def _validate_initialization_ready(self):
+        """Validate all required state is ready for network initialization"""
+        if self.input_dim is None:
+            raise ValueError("Input dimension must be set")
+        if self.output_dim is None:
+            raise ValueError("Output dimension must be set")
+        if not hasattr(self, 'classes_'):
+            raise ValueError("Classes must be determined")
+        if len(self.classes_) != self.output_dim:
+            raise ValueError(f"Number of classes ({len(self.classes_)}) does not match output dimension ({self.output_dim})")
+
+    def load_model(self, path):
+        """Load model from file."""
+        import os
+        import zipfile
         
-        # Initialize network with new output dimension if needed
-        if hasattr(self, 'network') and self.network is not None:
-            self._initialize_network()
+        path = str(path)
+        if not path.endswith('.zip'):
+            path = path + '.zip'
+            
+        if not os.path.exists(path):
+            raise ValueError(f"Model file not found at {path}")
+            
+        # Extract the zip file
+        base_path = path[:-4]
+        temp_dir = base_path + "_temp"
+        
+        with zipfile.ZipFile(path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+            
+        # Load parameters
+        with open(os.path.join(temp_dir, "model_params.json"), "r", encoding="utf8") as f:
+            loaded_params = json.load(f)
+            
+        # Load network state and additional info
+        checkpoint = torch.load(os.path.join(temp_dir, "network.pt"))
+        
+        # Clean up
+        shutil.rmtree(temp_dir)
+        
+        # Initialize with loaded parameters
+        self.__init__(**loaded_params["init_params"])
+        
+        # Set class attributes
+        for key, val in loaded_params["class_attrs"].items():
+            setattr(self, key, val)
+            
+        # Set critical attributes from checkpoint
+        self.input_dim = checkpoint['input_dim']
+        self.output_dim = checkpoint['output_dim']
+        self.classes_ = checkpoint['classes_']
+        self.preds_mapper = checkpoint['preds_mapper']
+        
+        # Initialize network with correct dimensions
+        self._initialize_network()
+        
+        # Load network state
+        self.network.load_state_dict(checkpoint['state_dict'])
+        
+        return self
 
     def _initialize_network(self) -> None:
-        """Initialize the network."""
-        if self.input_dim is None:
-            raise ValueError("Input dimension must be set before initializing network")
-            
-        # For classification, output_dim must match number of classes
-        if not hasattr(self, 'classes_'):
-            raise ValueError("Classes must be determined before initializing network")
-            
-        # Set output_dim based on number of classes
-        # Always use number of unique classes for output dimension
-        self.output_dim = len(self.classes_)
+        """Initialize the network with validation."""
+        # Validate initialization state
+        self._validate_initialization_ready()
 
         # Force network re-initialization
         if hasattr(self, 'network'):
             del self.network
             
-        # Initialize network with correct output dimension
+        # Initialize network with validated dimensions
         self.network = TabNet(
             input_dim=self.input_dim,
             output_dim=self.output_dim,
@@ -610,9 +701,31 @@ class TabNetClassifier(TabModel):
                     if not np.all(np.isfinite(X_eval)):
                         raise ValueError(f"Validation set {i} contains non-finite values (inf or nan)")
 
-        # Store class weights if using class balancing
+        # First validate and prepare input data
+        X_train = self._prepare_input(X_train)
+        if isinstance(X_train, (np.ndarray, pd.DataFrame)):
+            if len(X_train.shape) != 2:
+                raise ValueError(f"Expected 2D input array, got shape {X_train.shape}")
+            self.input_dim = X_train.shape[1]
+        
+        # Then prepare target data
+        y_train = self.prepare_target(y_train)
+        
+        # Set output dimensions
+        self._set_output_dim(y_train)
+        
+        # Prepare validation set
+        if eval_set is not None:
+            new_eval_set = []
+            for X_val, y_val in eval_set:
+                if len(X_val) > 0 and len(y_val) > 0:  # Only process non-empty sets
+                    X_val = self._prepare_input(X_val)
+                    y_val = self.prepare_target(y_val)
+                    new_eval_set.append((X_val, y_val))
+            eval_set = new_eval_set if new_eval_set else None
+        
+        # Handle weights after target data is prepared
         if isinstance(weights, (int, float)) and weights == 1:
-            unique_classes = np.unique(y_train)
             class_counts = np.bincount(y_train.ravel())
             self.class_weights = {i: 1.0 / count for i, count in enumerate(class_counts)}
         elif isinstance(weights, dict):
@@ -620,7 +733,7 @@ class TabNetClassifier(TabModel):
         elif isinstance(weights, np.ndarray):
             # Sample weights provided directly
             pass
-        
+            
         # Ensure batch_size is at least 2 for BatchNorm and not larger than dataset
         batch_size = max(2, min(batch_size, len(X_train)))
         
@@ -628,13 +741,9 @@ class TabNetClassifier(TabModel):
         if len(X_train) % batch_size == 1:
             drop_last = True
         
-        # Update fit params based on input data
+        # Update remaining fit params
         fit_params = self.update_fit_params(X_train, y_train, eval_set, weights)
-        self.input_dim = fit_params["input_dim"]
         self.updated_weights = fit_params["weights"]
-        
-        # Set output dimension and initialize class mapping
-        self._set_output_dim(y_train)
         
         # Initialize network if not already done
         if not hasattr(self, "network") or self.network is None:
