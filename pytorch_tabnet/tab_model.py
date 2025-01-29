@@ -3,6 +3,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from dataclasses import dataclass, field
+from pathlib import Path
+import json
+import shutil
 from .tab_network import TabNet
 from .utils import (
     PredictDataset,
@@ -10,7 +13,7 @@ from .utils import (
     check_target,
     define_device,
     ComplexEncoder,
-    SparsePredictDataset, 
+    SparsePredictDataset,
     filter_weights,
     create_explain_matrix
 )
@@ -89,6 +92,93 @@ class TabNetClassifier(TabModel):
         self.output_dim = None
         self.input_dim = None
         self.group_attention_matrix = None  # Initialize group_attention_matrix
+        
+    def save_model(self, path):
+        """Save model to file."""
+        saved_params = {}
+        init_params = {}
+        
+        # Save only initialization parameters
+        for key, val in self.get_params().items():
+            if isinstance(val, type):
+                continue
+            init_params[key] = val
+        
+        # Save critical dimensions and state
+        init_params["input_dim"] = self.input_dim
+        init_params["output_dim"] = self.output_dim
+        
+        saved_params["init_params"] = init_params
+        
+        # Save class attributes separately
+        class_attrs = {
+            "preds_mapper": self.preds_mapper,
+            "classes_": self.classes_,
+            "feature_importances_": getattr(self, "feature_importances_", None),
+            "_task": self._task,  # Save _task as class attribute
+            "input_dim": self.input_dim,  # Save dimensions in both places to ensure they're preserved
+            "output_dim": self.output_dim
+        }
+        saved_params["class_attrs"] = class_attrs
+        
+        # Save to file
+        base_path = str(path)
+        if base_path.endswith('.zip'):
+            base_path = base_path[:-4]
+        temp_dir = base_path + "_temp"
+        
+        Path(temp_dir).mkdir(parents=True, exist_ok=True)
+        
+        with open(Path(temp_dir).joinpath("model_params.json"), "w", encoding="utf8") as f:
+            json.dump(saved_params, f, cls=ComplexEncoder)
+            
+        torch.save(self.network.state_dict(), Path(temp_dir).joinpath("network.pt"))
+        
+        shutil.make_archive(base_path, "zip", temp_dir)
+        shutil.rmtree(temp_dir)
+        
+        print(f"Successfully saved model at {base_path}.zip")
+        return f"{base_path}.zip"
+        
+    def _initialize_network(self) -> None:
+        """Initialize the network."""
+        if self.input_dim is None:
+            raise ValueError("Input dimension must be set before initializing network")
+            
+        # For classification, output_dim must match number of classes
+        if not hasattr(self, 'classes_'):
+            raise ValueError("Classes must be determined before initializing network")
+            
+        # Set output_dim based on number of classes
+        # For binary classification, we need 2 outputs for proper cross-entropy
+        self.output_dim = len(self.classes_)
+            
+        # Force network re-initialization
+        if hasattr(self, 'network'):
+            del self.network
+            
+        # Initialize network with correct output dimension
+        self.network = TabNet(
+            input_dim=self.input_dim,
+            output_dim=self.output_dim,  # This will be 2 for binary and n_classes for multiclass
+            n_d=self.n_d,
+            n_a=self.n_a,
+            n_steps=self.n_steps,
+            gamma=self.gamma,
+            n_independent=self.n_independent,
+            n_shared=self.n_shared,
+            epsilon=self.epsilon,
+            virtual_batch_size=self.virtual_batch_size,
+            momentum=self.momentum,
+            mask_type=self.mask_type,
+        ).to(self.device)
+        
+        # Initialize loss function as CrossEntropyLoss with class weights if needed
+        if hasattr(self, 'class_weights') and self.class_weights is not None:
+            weights = torch.FloatTensor([self.class_weights[i] for i in range(self.output_dim)]).to(self.device)
+            self.loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
+        else:
+            self.loss_fn = torch.nn.CrossEntropyLoss()
 
     def _prepare_input(
         self, X: Union[DataFrame, np.ndarray], target_col: Optional[str] = None
@@ -106,13 +196,28 @@ class TabNetClassifier(TabModel):
         -------
         Union[np.ndarray, DataFrame]
             Prepared input data
+
+        Raises
+        ------
+        ValueError
+            If input contains non-finite values
         """
         if _HAVE_PYSPARK and isinstance(X, DataFrame):
             feature_cols = [col for col in X.columns if col != target_col]
             self.input_dim = len(feature_cols)
             return X
         else:
-            return super()._prepare_input(X)
+            # Convert to numpy array if needed
+            if isinstance(X, pd.DataFrame):
+                X = X.values
+            elif isinstance(X, torch.Tensor):
+                X = X.cpu().numpy()
+
+            # Check for non-finite values
+            if not np.all(np.isfinite(X)):
+                raise ValueError("Input contains non-finite values (inf or nan)")
+
+            return X
 
     def update_fit_params(
         self,
@@ -160,17 +265,9 @@ class TabNetClassifier(TabModel):
         if X_train.shape[0] != y_train.shape[0]:
             raise ValueError(f"X_train and y_train have different number of samples: {X_train.shape[0]} vs {y_train.shape[0]}")
 
-        # Determine number of unique classes
-        if len(y_train.shape) == 1 or y_train.shape[1] == 1:
-            self.classes_ = np.unique(y_train)
-            n_classes = len(self.classes_)
-        else:
-            self.classes_ = np.arange(y_train.shape[1])
-            n_classes = y_train.shape[1]
-
+        # Input dimension is always the number of features
         updated_params = {
             "input_dim": X_train.shape[1],
-            "output_dim": n_classes,
             "weights": weights
         }
 
@@ -197,8 +294,31 @@ class TabNetClassifier(TabModel):
         if len(y.shape) == 1:
             y = y.reshape(-1, 1)
             
+        # Initialize class mapping if not already done
+        if not hasattr(self, '_class_map'):
+            unique_classes = np.unique(y.ravel())
+            if len(unique_classes) < 2:
+                raise ValueError("Need at least 2 classes for classification")
+                
+            # Create mapping from original classes to 0-based indices
+            self._class_map = {val: idx for idx, val in enumerate(unique_classes)}
+            self.preds_mapper = {idx: val for idx, val in enumerate(unique_classes)}
+            self.classes_ = unique_classes
+            
+            # Set output dimension based on number of classes
+            self.output_dim = len(unique_classes)
+            
+            # Initialize network with correct output dimension if needed
+            if hasattr(self, 'network') and self.network is not None:
+                self._initialize_network()
+            
+        # Map classes to 0-based indices
+        if len(y.shape) == 1:
+            y = np.array([self._class_map[val] for val in y])
+        else:
+            y = np.array([self._class_map[val] for val in y.ravel()]).reshape(y.shape)
+            
         return y
-
     def compute_loss(self, y_score: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Compute the loss.
 
@@ -214,19 +334,24 @@ class TabNetClassifier(TabModel):
         torch.Tensor
             Loss value
         """
-        # CrossEntropyLoss expects class indices as targets, not one-hot encoding
-        if len(y_true.shape) > 1 and y_true.shape[1] > 1:
-            y_true = torch.argmax(y_true, dim=1)
-        elif len(y_true.shape) > 1:
-            y_true = y_true.squeeze(1)
-            
         # Ensure y_true is properly formatted for CrossEntropyLoss
+        if len(y_true.shape) > 1:
+            y_true = y_true.squeeze(1)
         y_true = y_true.long()
-        
-        # Ensure y_score has shape (N, C) where C matches number of classes
-        if y_score.shape[1] != self.output_dim:
-            raise ValueError(f"Network output dimension {y_score.shape[1]} does not match expected {self.output_dim}")
-            
+
+        # Validate target values are within bounds
+        if torch.any((y_true < 0) | (y_true >= len(self.classes_))):
+            raise ValueError(f"Target values must be between 0 and {len(self.classes_)-1}")
+
+        # For binary classification, if we get a single output dimension,
+        # expand it to 2 dimensions for proper cross-entropy
+        if len(self.classes_) == 2 and y_score.shape[1] == 1:
+            y_score = torch.cat([-y_score, y_score], dim=1)
+
+        # Ensure y_score has correct number of outputs after any transformations
+        if y_score.shape[1] != len(self.classes_):
+            raise ValueError(f"Model output dimension ({y_score.shape[1]}) does not match number of classes ({len(self.classes_)})")
+
         return self.loss_fn(y_score, y_true)
 
     def predict_func(self, outputs):
@@ -251,12 +376,21 @@ class TabNetClassifier(TabModel):
             )
 
         results = []
-        for batch_nb, data in enumerate(dataloader):
-            data = data.to(self.device).float()
+        with torch.no_grad():
+            for batch_nb, data in enumerate(dataloader):
+                data = data.to(self.device).float()
 
-            output, _ = self.network(data)
-            output = self.predict_func(output)
-            results.append(output.cpu().detach().numpy())
+                output, _ = self.network(data)
+                
+                # For binary classification with single output, apply sigmoid
+                if len(self.classes_) == 2 and output.shape[1] == 1:
+                    output = torch.sigmoid(output)
+                    # Convert to two-column format [1-p, p]
+                    output = torch.cat([1 - output, output], dim=1)
+                else:
+                    output = torch.nn.functional.softmax(output, dim=1)
+                    
+                results.append(output.cpu().numpy())
             
         results = np.vstack(results)
         return results
@@ -265,18 +399,25 @@ class TabNetClassifier(TabModel):
         """
         Make predictions for the input samples X.
         """
-        predictions = self.predict_proba(X)
-        if self.output_dim == 2:
-            # For binary classification, take the argmax instead of thresholding
-            predictions = predictions.argmax(axis=1)
-        else:
-            predictions = predictions.argmax(axis=1)
+        with torch.no_grad():
+            predictions = self.predict_proba(X)
             
-        # Map predictions back to original classes
-        if self.preds_mapper is not None:
-            predictions = np.vectorize(self.preds_mapper.get)(predictions)
+            # For binary classification, use threshold of 0.5 on positive class probability
+            if len(self.classes_) == 2:
+                if predictions.shape[1] == 1:
+                    # If we have a single output, use sigmoid threshold
+                    predictions = (predictions.squeeze() > 0).astype(int)
+                else:
+                    # If we have two outputs, use probability of positive class
+                    predictions = (predictions[:, 1] > 0.5).astype(int)
+            else:
+                predictions = predictions.argmax(axis=1)
             
-        return predictions
+            # Map predictions back to original classes if needed
+            if self.preds_mapper is not None:
+                predictions = np.vectorize(self.preds_mapper.get)(predictions)
+            
+            return predictions
 
     def stack_batches(self, list_y_true, list_y_score):
         """Stack batches for prediction.
@@ -375,37 +516,64 @@ class TabNetClassifier(TabModel):
         if len(y.shape) == 1:
             y_flat = y
         else:
-            y_flat = y.ravel() if y.shape[1] == 1 else y
+            y_flat = y.ravel()
 
+        # Get unique classes and create mappings
         self.classes_ = np.unique(y_flat)
-        # For classification, output_dim must match number of classes
-        self.output_dim = len(self.classes_)
-        if self.output_dim < 2:
+        if len(self.classes_) < 2:
             raise ValueError("Need at least 2 classes for classification")
             
-        # Always create preds_mapper
+        # Create consistent class mapping
+        self._class_map = {val: idx for idx, val in enumerate(self.classes_)}
         self.preds_mapper = {idx: val for idx, val in enumerate(self.classes_)}
+        
+        # Set output dimension to match number of classes
+        # For both binary and multiclass, output_dim should match number of classes
+        self.output_dim = len(self.classes_)
+        
+        # Initialize network with new output dimension if needed
+        if hasattr(self, 'network') and self.network is not None:
+            self._initialize_network()
 
     def _initialize_network(self) -> None:
         """Initialize the network."""
         if self.input_dim is None:
             raise ValueError("Input dimension must be set before initializing network")
-        if self.output_dim is None:
-            raise ValueError("Output dimension must be set before initializing network")
             
         # For classification, output_dim must match number of classes
-        if not hasattr(self, 'classes_') or len(self.classes_) != self.output_dim:
-            raise ValueError(f"Output dimension {self.output_dim} does not match number of classes {len(self.classes_) if hasattr(self, 'classes_') else 'unknown'}")
+        if not hasattr(self, 'classes_'):
+            raise ValueError("Classes must be determined before initializing network")
+            
+        # Set output_dim based on number of classes
+        # Always use number of unique classes for output dimension
+        self.output_dim = len(self.classes_)
 
         # Force network re-initialization
         if hasattr(self, 'network'):
             del self.network
             
-        self._set_network()
-        # For both binary and multiclass classification, use Softmax
-        self.predict_func = torch.nn.Softmax(dim=1)
-        # Initialize loss function as CrossEntropyLoss
-        self.loss_fn = torch.nn.CrossEntropyLoss()
+        # Initialize network with correct output dimension
+        self.network = TabNet(
+            input_dim=self.input_dim,
+            output_dim=self.output_dim,
+            n_d=self.n_d,
+            n_a=self.n_a,
+            n_steps=self.n_steps,
+            gamma=self.gamma,
+            n_independent=self.n_independent,
+            n_shared=self.n_shared,
+            epsilon=self.epsilon,
+            virtual_batch_size=self.virtual_batch_size,
+            momentum=self.momentum,
+            mask_type=self.mask_type,
+        ).to(self.device)
+        
+        # Initialize loss function as CrossEntropyLoss with class weights if needed
+        if hasattr(self, 'class_weights') and self.class_weights is not None:
+            weights = torch.FloatTensor([self.class_weights[i] for i in range(self.output_dim)]).to(self.device)
+            self.loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
+        else:
+            self.loss_fn = torch.nn.CrossEntropyLoss()
 
     def fit(
         self,
@@ -430,6 +598,18 @@ class TabNetClassifier(TabModel):
         compute_importance=True,
         from_epoch=0,
     ):
+        # Validate input data
+        if isinstance(X_train, (np.ndarray, pd.DataFrame)):
+            if not np.all(np.isfinite(X_train)):
+                raise ValueError("Training data contains non-finite values (inf or nan)")
+        
+        # Validate eval set
+        if eval_set is not None:
+            for i, (X_eval, _) in enumerate(eval_set):
+                if isinstance(X_eval, (np.ndarray, pd.DataFrame)):
+                    if not np.all(np.isfinite(X_eval)):
+                        raise ValueError(f"Validation set {i} contains non-finite values (inf or nan)")
+
         # Store class weights if using class balancing
         if isinstance(weights, (int, float)) and weights == 1:
             unique_classes = np.unique(y_train)
@@ -451,8 +631,10 @@ class TabNetClassifier(TabModel):
         # Update fit params based on input data
         fit_params = self.update_fit_params(X_train, y_train, eval_set, weights)
         self.input_dim = fit_params["input_dim"]
-        self.output_dim = fit_params["output_dim"]
         self.updated_weights = fit_params["weights"]
+        
+        # Set output dimension and initialize class mapping
+        self._set_output_dim(y_train)
         
         # Initialize network if not already done
         if not hasattr(self, "network") or self.network is None:

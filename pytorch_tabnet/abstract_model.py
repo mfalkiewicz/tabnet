@@ -508,7 +508,6 @@ class TabModel(BaseEstimator):
         # Save critical dimensions and state
         init_params["input_dim"] = self.input_dim
         init_params["output_dim"] = self.output_dim
-        init_params["_task"] = getattr(self, "_task", None)
         
         saved_params["init_params"] = init_params
         saved_params["state"] = {
@@ -522,7 +521,8 @@ class TabModel(BaseEstimator):
         class_attrs = {
             "preds_mapper": self.preds_mapper,
             "classes_": getattr(self, "classes_", None),
-            "feature_importances_": getattr(self, "feature_importances_", None)
+            "feature_importances_": getattr(self, "feature_importances_", None),
+            "_task": getattr(self, "_task", None)  # Save _task as class attribute
         }
         saved_params["class_attrs"] = class_attrs
 
@@ -578,8 +578,12 @@ class TabModel(BaseEstimator):
         except KeyError:
             raise KeyError("Your zip file is missing at least one component")
 
-        # Initialize with saved parameters
-        self.__init__(**loaded_params["init_params"])
+        # Initialize with saved parameters (excluding _task)
+        init_params = {k: v for k, v in loaded_params["init_params"].items() if k != '_task'}
+        self.__init__(**init_params)
+
+        # Load class attributes first to ensure _task is set before network initialization
+        self.load_class_attrs(loaded_params["class_attrs"])
 
         # Validate critical dimensions and classes
         if self.input_dim is None or self.output_dim is None:
@@ -591,7 +595,6 @@ class TabModel(BaseEstimator):
         self._initialize_network()
         self.network.load_state_dict(saved_state_dict)
         self.network.eval()
-        self.load_class_attrs(loaded_params["class_attrs"])
 
         return
 

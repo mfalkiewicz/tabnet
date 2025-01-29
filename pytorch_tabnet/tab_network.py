@@ -483,8 +483,8 @@ class TabNetNoEmbeddings(torch.nn.Module):
                 initialize_non_glu(task_mapping, n_d, task_dim)
                 self.multi_task_mappings.append(task_mapping)
         else:
-            # For classification, output_dim is number of classes
-            self.final_mapping = Linear(n_d, output_dim, bias=True)  # Added bias for classification
+            # For all classification cases (binary and multiclass), output_dim is number of classes
+            self.final_mapping = Linear(n_d, output_dim, bias=True)
             initialize_non_glu(self.final_mapping, n_d, output_dim)
 
     def forward(self, x):
