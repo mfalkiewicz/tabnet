@@ -4,7 +4,16 @@ import numpy as np
 import pandas as pd
 from pyspark.sql import SparkSession
 import tempfile
+import os
+import sys
 from pytorch_tabnet.typing import DataFrameLike, FloatArray
+
+
+@pytest.fixture(scope="session", autouse=True)
+def configure_spark_python():
+    """Configure PySpark Python executable paths."""
+    os.environ['PYSPARK_PYTHON'] = sys.executable
+    os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
 
 
 @pytest.fixture(scope="session")
@@ -17,6 +26,8 @@ def spark() -> Generator[SparkSession, None, None]:
         .config("spark.sql.shuffle.partitions", "2")
         .config("spark.default.parallelism", "2")
         .config("spark.sql.execution.arrow.enabled", "true")
+        .config("spark.pyspark.python", sys.executable)
+        .config("spark.pyspark.driver.python", sys.executable)
         .config(
             "spark.driver.extraJavaOptions", f"-Djava.io.tmpdir={tempfile.gettempdir()}"
         )
@@ -52,3 +63,28 @@ def classification_data(
         pytest.skip(f"Failed to create Spark DataFrame: {str(e)}")
 
     return {"numpy": (X, y), "pandas": pdf, "spark": sdf}
+
+
+def test_python_version_consistency(spark: SparkSession):
+    """Verify Python versions match between driver and workers."""
+    # Check driver Python version
+    driver_version = sys.version_info[:2]
+    
+    # Check worker Python version using UDF
+    def get_python_version():
+        import sys
+        return '.'.join(map(str, sys.version_info[:2]))
+    
+    worker_version = spark.sql("SELECT 1").select(
+        spark.udf.register("get_python_version", get_python_version)()
+    ).collect()[0][0]
+    
+    assert f"{driver_version[0]}.{driver_version[1]}" == worker_version
+
+
+def test_spark_python_configuration():
+    """Verify PySpark Python configuration."""
+    assert 'PYSPARK_PYTHON' in os.environ
+    assert 'PYSPARK_DRIVER_PYTHON' in os.environ
+    assert os.path.exists(os.environ['PYSPARK_PYTHON'])
+    assert os.path.exists(os.environ['PYSPARK_DRIVER_PYTHON'])

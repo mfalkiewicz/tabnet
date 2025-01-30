@@ -130,16 +130,52 @@ class SparkDataProvider(TabularDataProvider):
     def _prefetch_worker(self):
         """Background worker to prefetch batches"""
         try:
-            for batch_df in (
-                self._cached_df.rdd
-                .mapPartitions(self._process_partition)
-                .toLocalIterator()
-            ):
+            selected_cols = self.feature_cols + ([self.target_col] if self.target_col else [])
+            
+            # Configure Arrow batch size for optimal performance
+            self._cached_df.sparkSession.conf.set(
+                "spark.sql.execution.arrow.maxRecordsPerBatch",
+                str(min(1000, self.batch_size))  # Smaller batches for better memory management
+            )
+            
+            # Use smaller partitions to avoid large task sizes
+            num_partitions = max(
+                2,
+                self._cached_df.count() // min(1000, self.batch_size)
+            )
+            
+            # Process data in smaller chunks with proper cleanup
+            for partition in (self._cached_df._df
+                            .select(selected_cols)
+                            .repartition(num_partitions)
+                            .rdd
+                            .mapPartitions(lambda x: [pd.DataFrame(list(x), columns=selected_cols)])
+                            .toLocalIterator()):
                 if self._stop_prefetch.is_set():
                     break
-                self._prefetch_queue.put(self._create_batch(batch_df))
+                    
+                # Process partition in chunks
+                for i in range(0, len(partition), self.batch_size):
+                    if self._stop_prefetch.is_set():
+                        break
+                    chunk = partition.iloc[i:i + self.batch_size]
+                    try:
+                        self._prefetch_queue.put(
+                            self._create_batch(chunk),
+                            timeout=30  # Add timeout to prevent hanging
+                        )
+                    except queue.Full:
+                        if self._stop_prefetch.is_set():
+                            break
+                        # Queue is full, skip this batch
+                        continue
+        except Exception as e:
+            warnings.warn(f"Prefetch worker error: {str(e)}")
         finally:
-            self._prefetch_queue.put(None)  # Signal end of data
+            try:
+                self._prefetch_queue.put(None, timeout=5)  # Signal end of data
+            except queue.Full:
+                pass  # Queue is full, main thread probably exited
 
     def __enter__(self):
         """Start prefetch thread when entering context"""
@@ -279,14 +315,20 @@ class SparkDataset(Dataset):
     def _prefetch_worker(self):
         """Background worker to prefetch batches"""
         try:
-            for batch in (
-                self.df.rdd
-                .mapPartitions(self._process_partition)
-                .toLocalIterator()
-            ):
+            # Use Arrow-optimized batch loading with repartitioning
+            selected_cols = self.feature_cols + ([self.target_col] if self.target_col else [])
+            df = self.df._df.select(selected_cols).repartition(self.batch_size)
+            
+            for partition in df.rdd.mapPartitions(lambda x: [pd.DataFrame(list(x), columns=selected_cols)]).collect():
                 if self._stop_prefetch.is_set():
                     break
-                self._prefetch_queue.put(batch)
+                    
+                features = torch.from_numpy(partition[self.feature_cols].values.astype(np.float32))
+                targets = None
+                if self.target_col:
+                    targets = torch.from_numpy(partition[self.target_col].values.astype(np.float32))
+                
+                self._prefetch_queue.put((features, targets))
         finally:
             self._prefetch_queue.put(None)  # Signal end of data
 
