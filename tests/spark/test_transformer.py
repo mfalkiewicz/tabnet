@@ -1,0 +1,231 @@
+"""Tests for TabNet Spark ML transformer implementation."""
+
+import pytest
+import numpy as np
+from pyspark.sql import SparkSession
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import VectorAssembler
+from pyspark.sql.types import StructType, StructField, DoubleType, ArrayType
+import os
+
+from pytorch_tabnet.spark.transformer import SparkTabNetEstimator, SparkTabNetModel
+from pytorch_tabnet.dataframe import SparkDataFrame
+
+
+@pytest.fixture(scope="module")
+def spark():
+    """Create a SparkSession for testing."""
+    return (SparkSession.builder
+            .master("local[2]")
+            .appName("tabnet-transformer-test")
+            .getOrCreate())
+
+
+@pytest.fixture(scope="module")
+def test_data(spark):
+    """Create test data."""
+    np.random.seed(42)
+    n_samples = 1000
+    n_features = 10
+    
+    # Generate random features and binary labels
+    features = np.random.randn(n_samples, n_features).astype(np.float32)
+    labels = np.random.randint(0, 2, size=n_samples)
+    
+    # Create DataFrame with balanced classes
+    data = [(features[i].tolist(), float(labels[i])) for i in range(n_samples)]
+    schema = StructType([
+        StructField("features", ArrayType(DoubleType())),
+        StructField("label", DoubleType())
+    ])
+    
+    return spark.createDataFrame(data, schema)
+
+
+def test_spark_tabnet_estimator_initialization():
+    """Test proper initialization of SparkTabNetEstimator with various parameters."""
+    estimator = SparkTabNetEstimator(
+        inputCol="features",
+        outputCol="predictions",
+        n_d=8,
+        n_steps=3
+    )
+    assert estimator.getInputCol() == "features"
+    assert estimator.getOutputCol() == "predictions"
+    assert estimator.getOrDefault(estimator.n_d) == 8
+    assert estimator.getOrDefault(estimator.n_steps) == 3
+
+
+def test_dataframe_interface_integration(test_data):
+    """Test DataFrame interface integration."""
+    # Create wrapped DataFrame
+    wrapped_df = SparkDataFrame(test_data)
+    
+    # Verify interface methods
+    assert isinstance(wrapped_df.to_numpy(), np.ndarray)
+    assert isinstance(wrapped_df.get_column("features"), np.ndarray)
+    assert wrapped_df.validate_columns(["features", "label"])
+    assert len(wrapped_df.get_shape()) == 2
+
+
+def test_prepare_spark_data(test_data):
+    """Test data preparation method handles various input formats correctly."""
+    estimator = SparkTabNetEstimator(inputCol="features", outputCol="predictions")
+    
+    # Create wrapped DataFrame
+    wrapped_df = SparkDataFrame(test_data)
+    
+    # Verify DataFrame schema and interface methods
+    assert "features" in wrapped_df.columns
+    assert "label" in wrapped_df.columns
+    assert wrapped_df.count() > 0
+    
+    # Test data preparation
+    prepared_data = estimator._prepare_data(wrapped_df)
+    assert isinstance(prepared_data, SparkDataFrame)
+    assert prepared_data.validate_columns(["features", "label"])
+
+
+def test_spark_tabnet_model_transform(test_data):
+    """Test model transformation produces correct output schema and values."""
+    # Train model
+    estimator = SparkTabNetEstimator(
+        inputCol="features",
+        outputCol="predictions",
+        n_d=8,
+        n_steps=3
+    )
+    model = estimator.fit(test_data)
+    
+    # Transform data using DataFrame interface
+    wrapped_df = SparkDataFrame(test_data)
+    result = model.transform(test_data)
+    
+    # Verify predictions
+    assert "predictions" in result.columns
+    assert result.count() == test_data.count()
+    
+    # Check prediction values are valid
+    predictions = result.select("predictions").collect()
+    for row in predictions:
+        assert isinstance(row.predictions, list)
+        assert all(isinstance(x, float) for x in row.predictions)
+
+
+def test_pipeline_integration(test_data):
+    """Test SparkTabNet works correctly in a Spark ML pipeline."""
+    # Create pipeline
+    pipeline = Pipeline(stages=[
+        SparkTabNetEstimator(inputCol="features", outputCol="predictions")
+    ])
+    
+    # Fit pipeline
+    model = pipeline.fit(test_data)
+    
+    # Transform data using DataFrame interface
+    wrapped_df = SparkDataFrame(test_data)
+    predictions = model.transform(test_data)
+    
+    # Verify results
+    assert "predictions" in predictions.columns
+    assert predictions.count() == test_data.count()
+
+
+def test_data_type_compatibility(spark):
+    """Test handling of different data types and schemas."""
+    # Create test cases with different data types
+    test_cases = [
+        # Numeric features with balanced classes
+        spark.createDataFrame(
+            [(np.random.randn(5).tolist(), float(i % 2)) for i in range(10)],
+            ["features", "label"]
+        ),
+        # Integer features with balanced classes
+        spark.createDataFrame(
+            [(np.random.randint(0, 10, 5).tolist(), float(i % 2)) for i in range(10)],
+            ["features", "label"]
+        ),
+        # Mixed numeric types with balanced classes
+        spark.createDataFrame(
+            [([float(x) for x in np.random.randn(5)], float(i % 2)) for i in range(10)],
+            ["features", "label"]
+        )
+    ]
+    
+    estimator = SparkTabNetEstimator(inputCol="features", outputCol="predictions")
+    
+    for test_df in test_cases:
+        # Test with DataFrame interface
+        wrapped_df = SparkDataFrame(test_df)
+        model = estimator.fit(test_df)
+        result = model.transform(test_df)
+        assert result.count() == test_df.count()
+
+
+def test_large_scale_performance(spark):
+    """Test performance with large datasets."""
+    # Create large dataset with balanced classes
+    n_samples = 10000
+    n_features = 20
+    features = np.random.randn(n_samples, n_features).astype(np.float32)
+    labels = np.array([i % 2 for i in range(n_samples)])  # Ensure balanced classes
+    
+    data = [(features[i].tolist(), float(labels[i])) for i in range(n_samples)]
+    schema = StructType([
+        StructField("features", ArrayType(DoubleType())),
+        StructField("label", DoubleType())
+    ])
+    large_df = spark.createDataFrame(data, schema)
+    
+    # Train and transform using DataFrame interface
+    wrapped_df = SparkDataFrame(large_df)
+    estimator = SparkTabNetEstimator(inputCol="features", outputCol="predictions")
+    model = estimator.fit(large_df)
+    result = model.transform(large_df)
+    
+    # Verify results
+    assert result.count() == n_samples
+
+
+def test_model_persistence(tmp_path, test_data):
+    """Test model save and load functionality."""
+    # Train model
+    estimator = SparkTabNetEstimator(inputCol="features", outputCol="predictions")
+    model = estimator.fit(test_data)
+    
+    # Save model
+    model_path = str(tmp_path / "tabnet_model")
+    model.save(model_path)
+    
+    # Load model
+    loaded_model = SparkTabNetModel.load(model_path)
+    
+    # Compare predictions using DataFrame interface
+    wrapped_df = SparkDataFrame(test_data)
+    original_preds = model.transform(test_data).select("predictions").collect()
+    loaded_preds = loaded_model.transform(test_data).select("predictions").collect()
+    
+    for orig, loaded in zip(original_preds, loaded_preds):
+        np.testing.assert_array_almost_equal(orig.predictions, loaded.predictions)
+
+
+def test_edge_cases(spark, test_data):
+    """Test handling of edge cases and invalid inputs."""
+    # Empty DataFrame
+    empty_df = spark.createDataFrame(
+        [], 
+        StructType([
+            StructField("features", ArrayType(DoubleType())),
+            StructField("label", DoubleType())
+        ])
+    )
+    
+    estimator = SparkTabNetEstimator(inputCol="features", outputCol="predictions")
+    
+    # Should raise error for empty DataFrame
+    with pytest.raises(ValueError):
+        estimator.fit(empty_df)
+    
+    # Invalid column name
+    with pytest.raises(ValueError):
+        SparkTabNetEstimator(inputCol="nonexistent", outputCol="predictions").fit(test_data)
