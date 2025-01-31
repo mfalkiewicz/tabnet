@@ -113,7 +113,7 @@ def test_single_target_regression(regression_data):
     assert np.all(feat_imp >= 0)
 
     # Test explain
-    explain_matrix = reg.explain(X_test[:10])
+    explain_matrix, _ = reg.explain(X_test[:10])
     assert explain_matrix.shape == (10, X_test.shape[1])
 
 
@@ -208,7 +208,7 @@ def test_regressor_save_load(tmp_path, regression_data):
     # Compare predictions
     y_pred = reg.predict(X_test)
     y_pred_loaded = loaded_reg.predict(X_test)
-    assert np.allclose(y_pred, y_pred_loaded)
+    assert np.allclose(y_pred.predictions, y_pred_loaded.predictions)
 
 
 @pytest.mark.parametrize("batch_size", [16, 32, 64])

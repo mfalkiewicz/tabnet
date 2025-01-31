@@ -813,12 +813,17 @@ class TabNetRegressor(TabModel):
         Parameters
         ----------
         y : array-like
-            Target data
+            Target data. Must be 2-dimensional.
 
         Returns
         -------
         array-like
             Prepared target data
+
+        Raises
+        ------
+        ValueError
+            If input array is 1-dimensional
         """
         if isinstance(y, pd.DataFrame):
             y = y.values
@@ -826,7 +831,10 @@ class TabNetRegressor(TabModel):
             y = y.cpu().numpy()
             
         if len(y.shape) == 1:
-            y = y.reshape(-1, 1)
+            raise ValueError("Target array must be 2-dimensional. Use y.reshape(-1, 1) for single target.")
+            
+        if y.shape[1] == 0:
+            raise ValueError("Target array must have at least one column")
             
         return y
 

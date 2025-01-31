@@ -585,11 +585,13 @@ class TabModel(BaseEstimator):
         # Load class attributes first to ensure _task is set before network initialization
         self.load_class_attrs(loaded_params["class_attrs"])
 
-        # Validate critical dimensions and classes
+        # Validate critical dimensions
         if self.input_dim is None or self.output_dim is None:
             raise ValueError("Critical dimensions missing in loaded model")
-        if not hasattr(self, 'classes_') or len(self.classes_) != self.output_dim:
-            raise ValueError("Classes information missing or invalid in loaded model")
+        # Only validate classes for classification task
+        if self._task == "classification":
+            if not hasattr(self, 'classes_') or len(self.classes_) != self.output_dim:
+                raise ValueError("Classes information missing or invalid in loaded model")
             
         # Force network re-initialization and load saved state
         self._initialize_network()
