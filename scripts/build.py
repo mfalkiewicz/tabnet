@@ -1,44 +1,48 @@
 #!/usr/bin/env python3
+import argparse
 import subprocess
 import sys
-from pathlib import Path
 import os
 
+def bump_version(version_type):
+    """Bump the version."""
+    subprocess.run(["bumpversion", version_type], check=True)
 
-def run_command(
-    command: list[str], description: str, exit_on_error: bool = False
-) -> None:
-    """Run a command and optionally exit if it fails."""
-    print(f"\n=== Running {description} ===")
-    result = subprocess.run(command)
+def run_tests():
+    """Run tests using pytest."""
+    result = subprocess.run(["pytest", "--cov=src"], check=False)
     if result.returncode != 0:
-        if exit_on_error:
-            print(f"Error: {description} failed!")
+        print("Tests failed. Aborting build.")
+        sys.exit(result.returncode)
+
+def build_package():
+    """Build the package."""
+    subprocess.run(["python", "setup.py", "sdist", "bdist_wheel"], check=True)
+
+def release():
+    """Release the package."""
+    run_tests()
+    bump_version("patch")
+    build_package()
+    subprocess.run(["git", "push", "--tags"], check=True)
+
+def main():
+    parser = argparse.ArgumentParser(description="Build and release script.")
+    parser.add_argument("command", choices=["bump", "build", "release"], help="Command to execute")
+    parser.add_argument("--type", choices=["major", "minor", "patch"], help="Version type to bump")
+
+    args = parser.parse_args()
+
+    if args.command == "bump":
+        if not args.type:
+            print("Please specify a version type to bump: major, minor, or patch.")
             sys.exit(1)
-        else:
-            print(f"Warning: {description} encountered issues.")
-    else:
-        print(f"✓ {description} passed")
-
-
-def main() -> None:
-    # Ensure we're operating on the project root
-    project_root = Path(__file__).parent.parent
-    os.chdir(project_root)
-
-    # Clean up any previous builds
-    run_command(["rm", "-rf", "dist", "build", "*.egg-info"], "cleanup")
-
-    # Rest of commands...
-    run_command(["ruff", "check", "--fix", "--exit-zero", "."], "ruff fix")
-    run_command(["ruff", "check", "--exit-zero", "."], "ruff linting")
-    run_command(["ruff", "format", "."], "ruff format fix")
-    run_command(["mypy", "."], "mypy type checking", exit_on_error=True)
-    run_command(["pytest", "-v"], "pytest", exit_on_error=True)
-    run_command(["python", "-m", "build"], "package build", exit_on_error=True)
-
-    print("\n��� Build completed! ✨")
-
+        bump_version(args.type)
+    elif args.command == "build":
+        run_tests()
+        build_package()
+    elif args.command == "release":
+        release()
 
 if __name__ == "__main__":
     main()

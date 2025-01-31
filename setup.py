@@ -14,7 +14,7 @@ setup(
     name="pytorch_tabnet",
     version=version,
     cmdclass=cmdclass,
-    packages=find_packages(),
+    packages=find_packages(include=["cg_ml", "cg_ml.*"]),
     install_requires=[
         "torch>=1.8.0",
         "numpy>=1.19.0,<2.0.0",

@@ -1,82 +1,108 @@
-[project]
-name = "pytorch_tabnet"
-version = "4.0.0"
-description = "PyTorch implementation of TabNet with Spark support"
-requires-python = ">=3.11"
-dependencies = [
-    "torch>=2.1.0",  # For Apple Silicon GPU support
-    "numpy>=1.19.0,<2.0.0",
-    "scipy>=1.5.0",
-    "pandas>=1.0.0",
-    "scikit-learn>=0.24.0",
-    "pyspark>=3.0.0",
-    "petastorm>=0.11.0",
-    "pyarrow<12.0.0",
-    "typing-extensions>=4.0.0",
-    "polars>=1.21.0"
-]
-
 [build-system]
-requires = ["pdm-backend>=1.0.0"]
-build-backend = "pdm.backend"
+requires = ["setuptools", "wheel", "versioneer[toml]"]
+build-backend = "setuptools.build_meta"
 
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-check_untyped_defs = true
-disallow_untyped_decorators = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-warn_unreachable = true
-allow_subclassing_any = false
-strict_optional = true
-disable_error_code = []
-implicit_reexport = false
-allow_redefinition = false
-
-[[tool.mypy.overrides]]
-module = [
-    "torch.*",
-    "numpy.*",
-    "scipy.*",
-    "pyspark.*",
-    "petastorm.*",
-    "pytest.*",
-    "sklearn.*",
-    "pytorch_tabnet.tab_network"
+[project]
+name = "cg_ml"
+dynamic = ["version"]
+description = "Custom machine learning models and Spark transformers"
+authors = [{name = "Connells Group Data Platform Team", email = "connellsdataplatform@connellsgroup.co.uk"}]
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "pyspark",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scikit-learn",
+    "skrub",
+    "torch",
+    "transformers",
+    "sentence-transformers",
+    "mlflow",
+    "pandera",
+    "scipy",
+    "imbalanced_learn",
+    "beautifulsoup4",
+    "types-beautifulsoup4",
+    "huggingface-hub",
+    "pytorch-tabnet",
 ]
-ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')"
-]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-#addopts = "-v --cov=pytorch_tabnet --cov-report=term-missing"
-
-[tool.black]
-line-length = 88
-target-version = ['py310']
-include = '\.pyx?$'
-
-[tool.isort]
-profile = "black"
-multi-line_output = 3
 
 [project.optional-dependencies]
 dev = [
-    "ruff",
-    "mypy>=1.0.0",
     "pytest",
-    "build",
+    "pytest-cov",
+    "pytest-spark",
+    "pytest-xdist",
+    "pytest-mock",
+    "ruff",
+    "mypy",
+    "pre-commit",
+    "pip-tools",
+    "tox",
+    "gitpython",
     "pandas-stubs",
+    "types-requests",
     "types-setuptools",
-    "tomli>=2.0.0",
-    "coverage"
+    "seaborn",
+    "sdv",
+    "psutil",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+filterwarnings = [
+    "ignore::DeprecationWarning:pyspark.*:",
+    "ignore::DeprecationWarning:pandas.*:"
+]
+
+[tool.ruff]
+# Line length matches black's default
+line-length = 88
+indent-width = 4
+# Same as Black.
+target-version = "py311"
+
+[tool.ruff.lint]
+# Enable pycodestyle (`E`) and Pyflakes (`F`) codes by default.
+select = ["E", "F"]
+ignore = []
+
+# Allow autofix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+# Like Black, automatically detect the appropriate line ending.
+line-ending = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+strict = false
+install_types = true
+non_interactive = true
+ignore_missing_imports = true
+check_untyped_defs = true
+exclude = [
+    "src/cg_ml/_version\\.py$"  # Ignore versioneer-generated file
+]
+
+[tool.versioneer]
+VCS = "git"
+style = "pep440"
+versionfile_source = "src/cg_ml/_version.py"
+versionfile_build = "cg_ml/_version.py"
+tag_prefix = "v"
+parentdir_prefix = "cg_ml-"
+lookback = 200
