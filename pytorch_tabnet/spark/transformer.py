@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional
 import numpy as np
 import pandas as pd
 import torch
-from pyspark.ml.param.shared import HasInputCol, HasOutputCol, HasPredictionCol
+from pyspark.ml.param.shared import HasInputCol, HasOutputCol, HasPredictionCol, HasLabelCol
 from pyspark.ml import Estimator, Model
 from pyspark.ml.param import Param, Params, TypeConverters
 from pyspark.sql import DataFrame
@@ -34,8 +34,10 @@ class TabNetParams(Params):
                 typeConverter=TypeConverters.toFloat)
     cat_idxs = Param(Params._dummy(), "cat_idxs", "List of categorical feature indices", 
                 typeConverter=TypeConverters.toListInt)
-    cat_dims = Param(Params._dummy(), "cat_dims", "List of categorical feature dimensions", 
-                typeConverter=TypeConverters.toListInt)
+    cat_dims = Param(Params._dummy(), "cat_dims", "List of categorical feature dimensions",
+                 typeConverter=TypeConverters.toListInt)
+    labelCols = Param(Params._dummy(), "labelCols", "List of label column names",
+                 typeConverter=TypeConverters.toListString)
     
     def __init__(self):
         super().__init__()
@@ -45,9 +47,14 @@ class TabNetParams(Params):
             n_steps=3,
             gamma=1.3,
             cat_idxs=[],
-            cat_dims=[]
+            cat_dims=[],
+            labelCols=["label"]
         )
     
+    def getLabelCols(self) -> List[str]:
+        """Get the list of label column names."""
+        return self.getOrDefault(self.labelCols)
+        
     def _get_tabnet_params(self) -> Dict[str, Any]:
         """Get parameters for TabNetClassifier initialization."""
         return {
@@ -72,9 +79,12 @@ class SparkTabNetEstimator(Estimator, TabNetParams, HasInputCol, HasOutputCol):
         **kwargs: Additional parameters passed to TabNetClassifier
     """
     
-    def __init__(self, inputCol: str = "features", outputCol: str = "predictions", **kwargs):
+    def __init__(self, inputCol: str = "features", outputCol: str = "predictions",
+                 labelCols: List[str] = None, **kwargs):
         super().__init__()
-        self._set(inputCol=inputCol, outputCol=outputCol)
+        if labelCols is None:
+            labelCols = ["label"]
+        self._set(inputCol=inputCol, outputCol=outputCol, labelCols=labelCols)
         self.tabnet = None
         self._set(**kwargs)
     
@@ -87,7 +97,8 @@ class SparkTabNetEstimator(Estimator, TabNetParams, HasInputCol, HasOutputCol):
         Returns:
             Prepared DataFrame
         """
-        return df.select(self.getInputCol(), "label")
+        columns = [self.getInputCol()] + self.getLabelCols()
+        return df.select(*columns)
     
     def _convert_features(self, features_array: np.ndarray) -> np.ndarray:
         """Convert features array to proper format for TabNet.
@@ -115,8 +126,9 @@ class SparkTabNetEstimator(Estimator, TabNetParams, HasInputCol, HasOutputCol):
         # Validate input columns
         if self.getInputCol() not in dataset.columns:
             raise ValueError(f"Input column '{self.getInputCol()}' not found in dataset")
-        if "label" not in dataset.columns:
-            raise ValueError("Label column 'label' not found in dataset")
+        for label_col in self.getLabelCols():
+            if label_col not in dataset.columns:
+                raise ValueError(f"Label column '{label_col}' not found in dataset")
             
         # Initialize TabNet model with parameters
         self.tabnet = TabNetClassifier(**self._get_tabnet_params())
@@ -127,7 +139,12 @@ class SparkTabNetEstimator(Estimator, TabNetParams, HasInputCol, HasOutputCol):
         
         # Extract features and labels using interface
         features = prepared_data.get_column(self.getInputCol())
-        labels = prepared_data.get_column("label")
+        # Currently only using first label column as multi-task learning is not yet supported
+        if len(self.getLabelCols()) > 1:
+            import warnings
+            warnings.warn("Multi-task learning is not yet supported. Using only the first label column.")
+        
+        labels = prepared_data.get_column(self.getLabelCols()[0])
         
         if len(features) == 0:
             raise ValueError("Empty dataset")

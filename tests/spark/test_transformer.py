@@ -209,6 +209,52 @@ def test_model_persistence(tmp_path, test_data):
         np.testing.assert_array_almost_equal(orig.predictions, loaded.predictions)
 
 
+def test_custom_label_column(spark):
+    """Test that estimator works with custom label columns and handles multi-task warning."""
+    # Create test data with multiple label columns
+    n_samples = 100
+    n_features = 5
+    features = np.random.randn(n_samples, n_features).astype(np.float32)
+    labels1 = np.random.randint(0, 2, size=n_samples)
+    labels2 = np.random.randint(0, 3, size=n_samples)  # Second task with 3 classes
+    
+    data = [(features[i].tolist(), float(labels1[i]), float(labels2[i])) for i in range(n_samples)]
+    schema = StructType([
+        StructField("features", ArrayType(DoubleType())),
+        StructField("task1_label", DoubleType()),
+        StructField("task2_label", DoubleType())
+    ])
+    df = spark.createDataFrame(data, schema)
+    
+    # Train model with multiple label columns
+    estimator = SparkTabNetEstimator(
+        inputCol="features",
+        outputCol="predictions",
+        labelCols=["task1_label", "task2_label"]
+    )
+    
+    # Verify warning about multi-task not being supported
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        model = estimator.fit(df)
+        assert len(w) > 0
+        assert any("Multi-task learning is not yet supported" in str(warning.message) for warning in w)
+    
+    # Transform data
+    result = model.transform(df)
+    
+    # Verify predictions (should be based on first label column only)
+    assert "predictions" in result.columns
+    assert result.count() == df.count()
+    predictions = result.select("predictions").collect()
+    for row in predictions:
+        assert isinstance(row.predictions, list)
+        assert all(isinstance(x, float) for x in row.predictions)
+        # Should only have predictions for first task
+        assert len(row.predictions) == 2  # Binary classification has 2 probabilities
+
+
 def test_edge_cases(spark, test_data):
     """Test handling of edge cases and invalid inputs."""
     # Empty DataFrame

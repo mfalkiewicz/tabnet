@@ -1,2 +1,2 @@
 pytorch_tabnet/_version.py export-subst
-src/cg_ml/_version.py export-subst
+src/pytorch_tabnet/_version.py export-subst

@@ -10,7 +10,7 @@ def bump_version(version_type):
 
 def run_tests():
     """Run tests using pytest."""
-    result = subprocess.run(["pytest", "--cov=src"], check=False)
+    result = subprocess.run(["pytest", "--cov=pytorch_tabnet"], check=False)
     if result.returncode != 0:
         print("Tests failed. Aborting build.")
         sys.exit(result.returncode)

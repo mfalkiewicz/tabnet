@@ -14,7 +14,7 @@ setup(
     name="pytorch_tabnet",
     version=version,
     cmdclass=cmdclass,
-    packages=find_packages(include=["cg_ml", "cg_ml.*"]),
+    packages=find_packages(include=["pytorch_tabnet", "pytorch_tabnet.*"]),
     install_requires=[
         "torch>=1.8.0",
         "numpy>=1.19.0,<2.0.0",
@@ -25,5 +25,5 @@ setup(
         "petastorm>=0.11.0",
         "pyarrow<12.0.0",
     ],
-    python_requires=">=3.7",
+    python_requires=">=3.10,<3.12",
 )
