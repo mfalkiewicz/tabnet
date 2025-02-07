@@ -8,7 +8,11 @@ from pyspark.ml.feature import VectorAssembler
 from pyspark.sql.types import StructType, StructField, DoubleType, ArrayType
 import os
 
-from pytorch_tabnet.spark.transformer import SparkTabNetEstimator, SparkTabNetModel
+from pytorch_tabnet.spark.transformer import (
+    SparkTabNetEstimator,
+    SparkTabNetModel,
+    get_tabnet_classifier
+)
 from pytorch_tabnet.dataframe import SparkDataFrame
 
 
@@ -253,6 +257,29 @@ def test_custom_label_column(spark):
         assert all(isinstance(x, float) for x in row.predictions)
         # Should only have predictions for first task
         assert len(row.predictions) == 2  # Binary classification has 2 probabilities
+
+
+def test_pickle_serialization(test_data):
+    """Test that the entire SparkTabNetModel can be serialized using pickle."""
+    import pickle
+    from io import BytesIO
+    
+    # Train model
+    estimator = SparkTabNetEstimator(inputCol="features", outputCol="predictions")
+    model = estimator.fit(test_data)
+    
+    # Test pickling the entire model
+    bio = BytesIO()
+    pickle.dump(model, bio)
+    bio.seek(0)
+    loaded_model = pickle.load(bio)
+    
+    # Compare predictions
+    original_preds = model.transform(test_data).select("predictions").collect()
+    loaded_preds = loaded_model.transform(test_data).select("predictions").collect()
+    
+    for orig, loaded in zip(original_preds, loaded_preds):
+        np.testing.assert_array_almost_equal(orig.predictions, loaded.predictions)
 
 
 def test_edge_cases(spark, test_data):

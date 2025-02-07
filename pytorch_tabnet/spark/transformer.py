@@ -17,8 +17,13 @@ from pyspark.sql.types import DoubleType, ArrayType
 from pyspark.ml.util import MLReadable, MLWritable, MLReader, MLWriter, DefaultParamsReader, DefaultParamsWriter
 import os
 
-from pytorch_tabnet.tab_model import TabNetClassifier
 from pytorch_tabnet.dataframe import SparkDataFrame, TabNetDataFrame
+
+# Import TabNetClassifier lazily to avoid circular imports
+def get_tabnet_classifier():
+    """Get TabNetClassifier class lazily to avoid circular imports."""
+    from pytorch_tabnet.tab_model import TabNetClassifier
+    return TabNetClassifier
 
 
 class TabNetParams(Params):
@@ -131,6 +136,7 @@ class SparkTabNetEstimator(Estimator, TabNetParams, HasInputCol, HasOutputCol):
                 raise ValueError(f"Label column '{label_col}' not found in dataset")
             
         # Initialize TabNet model with parameters
+        TabNetClassifier = get_tabnet_classifier()
         self.tabnet = TabNetClassifier(**self._get_tabnet_params())
         
         # Use DataFrame interface
@@ -163,6 +169,55 @@ class SparkTabNetEstimator(Estimator, TabNetParams, HasInputCol, HasOutputCol):
 
 
 class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredictionCol, MLReadable, MLWritable):
+    """Spark ML Model for TabNet predictions."""
+    
+    def __getstate__(self):
+        """Get state for pickling."""
+        state = self.__dict__.copy()
+        # Save TabNet model state
+        if self.tabnet is not None:
+            state['_tabnet_state'] = {
+                'n_d': self.tabnet.n_d,
+                'n_a': self.tabnet.n_a,
+                'n_steps': self.tabnet.n_steps,
+                'gamma': self.tabnet.gamma,
+                'cat_idxs': self.tabnet.cat_idxs,
+                'cat_dims': self.tabnet.cat_dims,
+                'input_dim': self.tabnet.input_dim,
+                'output_dim': self.tabnet.output_dim,
+                'classes_': self.tabnet.classes_,
+                'state_dict': self.tabnet.network.state_dict()
+            }
+            # Remove unpickleable objects
+            state.pop('tabnet', None)
+        return state
+    
+    def __setstate__(self, state):
+        """Set state for unpickling."""
+        # Restore TabNet model if state exists
+        if '_tabnet_state' in state:
+            tabnet_state = state.pop('_tabnet_state')
+            TabNetClassifier = get_tabnet_classifier()
+            self.tabnet = TabNetClassifier(
+                n_d=tabnet_state['n_d'],
+                n_a=tabnet_state['n_a'],
+                n_steps=tabnet_state['n_steps'],
+                gamma=tabnet_state['gamma'],
+                cat_idxs=tabnet_state['cat_idxs'],
+                cat_dims=tabnet_state['cat_dims'],
+                input_dim=tabnet_state['input_dim'],
+                output_dim=tabnet_state['output_dim']
+            )
+            # Set dimensions before initializing network
+            self.tabnet.input_dim = tabnet_state['input_dim']
+            self.tabnet.output_dim = tabnet_state['output_dim']
+            # Initialize the network
+            self.tabnet._set_network()
+            # Set classes
+            self.tabnet.classes_ = tabnet_state['classes_']
+            # Load the model state
+            self.tabnet.network.load_state_dict(tabnet_state['state_dict'])
+        self.__dict__.update(state)
     """Spark ML Model for TabNet predictions.
     
     This model provides distributed prediction capabilities using the trained TabNet model
@@ -176,7 +231,7 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
     
     def __init__(
         self,
-        tabnet_model: TabNetClassifier = None,
+        tabnet_model: Any = None,
         inputCol: str = "features",
         outputCol: str = "predictions"
     ):
@@ -225,6 +280,7 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
         def predict_batch(features_series):
             """Vectorized UDF for predictions."""
             # Create a new model instance for this executor
+            TabNetClassifier = get_tabnet_classifier()
             local_model = TabNetClassifier(
                 n_d=model_state['n_d'],
                 n_a=model_state['n_a'],
@@ -235,6 +291,11 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
                 input_dim=model_state['input_dim'],
                 output_dim=model_state['output_dim']
             )
+            # Set dimensions before initializing network
+            local_model.input_dim = model_state['input_dim']
+            local_model.output_dim = model_state['output_dim']
+            # Initialize the network
+            local_model._set_network()
             # Set classes
             local_model.classes_ = model_state['classes_']
             # Load the model state
@@ -294,6 +355,7 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
         params._copyValues(model)
         # Load TabNet model
         tabnet_path = os.path.join(path, "tabnet_model")
+        TabNetClassifier = get_tabnet_classifier()
         model.tabnet = TabNetClassifier()
         model.tabnet = model.tabnet.load_model(tabnet_path)
         return model
