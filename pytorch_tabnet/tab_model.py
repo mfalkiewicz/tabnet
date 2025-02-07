@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 import scipy
 import pandas as pd
 from torch import Tensor
+import pickle
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame
@@ -93,69 +94,57 @@ class TabNetClassifier(TabModel):
         self.input_dim = None
         self.group_attention_matrix = None  # Initialize group_attention_matrix
         
+
+
+    def __getstate__(self):
+        """Return state values to be pickled."""
+        # 1. Validate or remove any non-picklable attributes if needed
+        # 2. Build a dictionary of everything you need to re-create the object
+        state = self.__dict__.copy()
+        # The network's state_dict is safe to pickle, but the device references might not be
+        # so store only the state_dict:
+        state["network_state"] = self.network.state_dict()
+        # Remove the actual network to avoid recursion or device errors
+        del state["network"]
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from pickle."""
+        # 1. Restore all attributes
+        self.__dict__.update(state)
+        # 2. Re-initialize the network
+        self._initialize_network()
+        # 3. Load the state_dict
+        self.network.load_state_dict(self.__dict__["network_state"])
+        # 4. Cleanup
+        del self.__dict__["network_state"]
+
     def save_model(self, path):
-        """Save model to file with validation."""
+        """Save model to a pickle file without zipping."""
         # Validate model state before saving
         self._validate_dimensions()
-        
-        saved_params = {}
-        init_params = {}
-        
-        # Save only initialization parameters with type conversion
-        for key, val in self.get_params().items():
-            if isinstance(val, type):
-                continue
-            if isinstance(key, np.integer):
-                key = int(key)
-            init_params[key] = val
-        
-        # Save critical dimensions and state
-        init_params["input_dim"] = self.input_dim
-        init_params["output_dim"] = self.output_dim
-        
-        saved_params["init_params"] = init_params
-        
-        # Convert numpy types in class attributes
-        class_attrs = {
-            "preds_mapper": {int(k) if isinstance(k, np.integer) else k: v
-                           for k, v in (self.preds_mapper or {}).items()},
-            "classes_": self.classes_.tolist() if isinstance(self.classes_, np.ndarray) else self.classes_,
-            "_class_map": {int(k) if isinstance(k, np.integer) else k: int(v) if isinstance(v, np.integer) else v
-                          for k, v in (self._class_map or {}).items()},
-            "feature_importances_": getattr(self, "feature_importances_", None),
-            "_task": self._task,
-            "input_dim": self.input_dim,
-            "output_dim": self.output_dim,
-            "version": "1.0.0"
+
+        # Create a dictionary of everything you need
+        save_dict = {
+            "init_params": self.get_params(),
+            "class_attrs": {
+                "preds_mapper": self.preds_mapper,
+                "classes_": self.classes_,
+                "_class_map": self._class_map,
+                "feature_importances_": getattr(self, "feature_importances_", None),
+                "_task": self._task,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "version": "1.0.0"
+            },
+            "network_state": self.network.state_dict(),
         }
-        saved_params["class_attrs"] = class_attrs
-        
-        # Save to file
-        base_path = str(path)
-        if base_path.endswith('.zip'):
-            base_path = base_path[:-4]
-        temp_dir = base_path + "_temp"
-        
-        Path(temp_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Save model parameters
-        with open(Path(temp_dir).joinpath("model_params.json"), "w", encoding="utf8") as f:
-            json.dump(saved_params, f, cls=ComplexEncoder)
-            
-        # Save network state with full state dict
-        torch.save({
-            'state_dict': self.network.state_dict(),
-            'input_dim': self.input_dim,
-            'output_dim': self.output_dim,
-            'classes_': self.classes_,
-            'preds_mapper': self.preds_mapper
-        }, Path(temp_dir).joinpath("network.pt"))
-        
-        shutil.make_archive(base_path, "zip", temp_dir)
-        shutil.rmtree(temp_dir)
-        
-        print(f"Successfully saved model at {base_path}.zip")
-        return f"{base_path}.zip"
+
+        with open(path, 'wb') as f:
+            pickle.dump(save_dict, f)
+
+        print(f"Model saved (pickle) at: {path}")
+        return path
         
     def _initialize_network(self) -> None:
         """Initialize the network."""
@@ -585,53 +574,23 @@ class TabNetClassifier(TabModel):
             raise ValueError(f"Number of classes ({len(self.classes_)}) does not match output dimension ({self.output_dim})")
 
     def load_model(self, path):
-        """Load model from file."""
-        import os
-        import zipfile
-        
-        path = str(path)
-        if not path.endswith('.zip'):
-            path = path + '.zip'
-            
-        if not os.path.exists(path):
-            raise ValueError(f"Model file not found at {path}")
-            
-        # Extract the zip file
-        base_path = path[:-4]
-        temp_dir = base_path + "_temp"
-        
-        with zipfile.ZipFile(path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-            
-        # Load parameters
-        with open(os.path.join(temp_dir, "model_params.json"), "r", encoding="utf8") as f:
-            loaded_params = json.load(f)
-            
-        # Load network state and additional info
-        checkpoint = torch.load(os.path.join(temp_dir, "network.pt"))
-        
-        # Clean up
-        shutil.rmtree(temp_dir)
-        
-        # Initialize with loaded parameters
+        """Load model from a pickle file (no zip)."""
+        with open(path, 'rb') as f:
+            loaded_params = pickle.load(f)
+
+        # Re-initialize with the stored init_params
         self.__init__(**loaded_params["init_params"])
-        
-        # Set class attributes
-        for key, val in loaded_params["class_attrs"].items():
-            setattr(self, key, val)
-            
-        # Set critical attributes from checkpoint
-        self.input_dim = checkpoint['input_dim']
-        self.output_dim = checkpoint['output_dim']
-        self.classes_ = checkpoint['classes_']
-        self.preds_mapper = checkpoint['preds_mapper']
-        
-        # Initialize network with correct dimensions
+
+        # Restore class attributes
+        for k, v in loaded_params["class_attrs"].items():
+            setattr(self, k, v)
+
+        # Make sure your network is initialized properly
         self._initialize_network()
-        
-        # Load network state
-        self.network.load_state_dict(checkpoint['state_dict'])
-        
+
+        # Load state_dict
+        self.network.load_state_dict(loaded_params["network_state"])
+
         return self
 
     def _initialize_network(self) -> None:

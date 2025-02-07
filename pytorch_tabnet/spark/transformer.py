@@ -16,6 +16,7 @@ from pyspark.sql.functions import pandas_udf
 from pyspark.sql.types import DoubleType, ArrayType
 from pyspark.ml.util import MLReadable, MLWritable, MLReader, MLWriter, DefaultParamsReader, DefaultParamsWriter
 import os
+import pickle
 
 from pytorch_tabnet.dataframe import SparkDataFrame, TabNetDataFrame
 
@@ -332,10 +333,28 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
         Args:
             path: Path to save the model
         """
+        # Save Spark ML model metadata
         self.write().save(path)
-        # Save TabNet model separately
-        tabnet_path = os.path.join(path, "tabnet_model")
-        self.tabnet.save_model(tabnet_path)
+        
+        # Save TabNet model state
+        if self.tabnet is not None:
+            model_state = {
+                'n_d': self.tabnet.n_d,
+                'n_a': self.tabnet.n_a,
+                'n_steps': self.tabnet.n_steps,
+                'gamma': self.tabnet.gamma,
+                'cat_idxs': self.tabnet.cat_idxs,
+                'cat_dims': self.tabnet.cat_dims,
+                'input_dim': self.tabnet.input_dim,
+                'output_dim': self.tabnet.output_dim,
+                'classes_': self.tabnet.classes_,
+                'state_dict': self.tabnet.network.state_dict()
+            }
+            import pickle
+            import os
+            model_path = os.path.join(path, "tabnet_model.pkl")
+            with open(model_path, 'wb') as f:
+                pickle.dump(model_state, f)
     
     @classmethod
     def load(cls, path: str) -> "SparkTabNetModel":
@@ -347,15 +366,40 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
         Returns:
             Loaded SparkTabNetModel instance
         """
-        # Create model instance without TabNet model
-        model = cls()
-        # Load parameters
+        # Load Spark ML model metadata
         reader = DefaultParamsReader(cls)
+        model = cls()
         params = reader.load(path)
         params._copyValues(model)
-        # Load TabNet model
-        tabnet_path = os.path.join(path, "tabnet_model")
-        TabNetClassifier = get_tabnet_classifier()
-        model.tabnet = TabNetClassifier()
-        model.tabnet = model.tabnet.load_model(tabnet_path)
+        
+        # Load TabNet model state
+        import pickle
+        import os
+        model_path = os.path.join(path, "tabnet_model.pkl")
+        if os.path.exists(model_path):
+            with open(model_path, 'rb') as f:
+                model_state = pickle.load(f)
+            
+            # Initialize TabNet model
+            TabNetClassifier = get_tabnet_classifier()
+            model.tabnet = TabNetClassifier(
+                n_d=model_state['n_d'],
+                n_a=model_state['n_a'],
+                n_steps=model_state['n_steps'],
+                gamma=model_state['gamma'],
+                cat_idxs=model_state['cat_idxs'],
+                cat_dims=model_state['cat_dims'],
+                input_dim=model_state['input_dim'],
+                output_dim=model_state['output_dim']
+            )
+            # Set dimensions before initializing network
+            model.tabnet.input_dim = model_state['input_dim']
+            model.tabnet.output_dim = model_state['output_dim']
+            # Initialize the network
+            model.tabnet._set_network()
+            # Set classes
+            model.tabnet.classes_ = model_state['classes_']
+            # Load the model state
+            model.tabnet.network.load_state_dict(model_state['state_dict'])
+        
         return model
