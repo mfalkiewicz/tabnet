@@ -282,6 +282,89 @@ def test_pickle_serialization(test_data):
         np.testing.assert_array_almost_equal(orig.predictions, loaded.predictions)
 
 
+def test_model_serialization_edge_cases(spark, tmp_path):
+    """Test edge cases in model serialization."""
+    # Create minimal test data
+    # Create data with two classes for classification
+    df = spark.createDataFrame([
+        (np.random.randn(5).tolist(), float(0)),
+        (np.random.randn(5).tolist(), float(1))
+    ], ["features", "label"])
+    
+    # Train model
+    estimator = SparkTabNetEstimator(inputCol="features", outputCol="predictions")
+    model = estimator.fit(df)
+    
+    # Test saving to empty path
+    with pytest.raises(ValueError, match="Path cannot be empty"):
+        model.save("")
+    
+    # Test loading from empty path
+    with pytest.raises(ValueError, match="Path cannot be empty"):
+        SparkTabNetModel.load("")
+    
+    # Test loading from non-existent path
+    with pytest.raises(ValueError, match="Model path does not exist"):
+        SparkTabNetModel.load(str(tmp_path / "nonexistent"))
+    
+    # Save model without TabNet state
+    model_path = str(tmp_path / "incomplete_model")
+    model.save(model_path)
+    os.remove(os.path.join(model_path, "tabnet_model.pkl"))
+    
+    # Test loading model with missing TabNet state
+    with pytest.raises(ValueError, match="TabNet model state file not found"):
+        SparkTabNetModel.load(model_path)
+
+
+def test_mlflow_integration(spark, tmp_path, test_data):
+    """Test MLflow integration for model serialization."""
+    import mlflow
+    import mlflow.spark
+
+    # Train model
+    estimator = SparkTabNetEstimator(inputCol="features", outputCol="predictions")
+    model = estimator.fit(test_data)
+
+    # Log model using MLflow
+    with mlflow.start_run():
+        model_path = str(tmp_path / "mlflow_model")
+        mlflow.spark.save_model(model, model_path)
+
+        # Load model using MLflow
+        loaded_model = mlflow.spark.load_model(model_path)
+
+        print("\nLoaded model type:", type(loaded_model))
+        print("Loaded model attributes:", dir(loaded_model))
+        if hasattr(loaded_model, "stages"):
+            print("Pipeline stages:", [type(stage) for stage in loaded_model.stages])
+            for stage in loaded_model.stages:
+                print(f"Stage type: {type(stage)}")
+                print(f"Stage attributes: {dir(stage)}")
+                if hasattr(stage, "_mlflow_model_info"):
+                    print("Stage MLflow info:", stage._mlflow_model_info)
+
+        # Verify predictions
+        original_preds = model.transform(test_data).select("predictions").collect()
+        loaded_preds = loaded_model.transform(test_data).select("predictions").collect()
+
+        for orig, loaded in zip(original_preds, loaded_preds):
+            np.testing.assert_array_almost_equal(orig.predictions, loaded.predictions)
+
+        # Instead of asserting a top-level 'tabnet', extract the SparkTabNetModel stage.
+        if hasattr(loaded_model, "stages"):
+            spark_tabnet_stage = None
+            for stage in loaded_model.stages:
+                if hasattr(stage, "tabnet"):
+                    spark_tabnet_stage = stage
+                    break
+            assert spark_tabnet_stage is not None, "SparkTabNetModel stage not found in loaded pipeline"
+            assert spark_tabnet_stage.tabnet is not None, "SparkTabNetModel stage missing tabnet attribute"
+        else:
+            # For non-pipeline models, assert directly.
+            assert hasattr(loaded_model, 'tabnet') and loaded_model.tabnet is not None, "Loaded model tabnet attribute missing"
+
+
 def test_edge_cases(spark, test_data):
     """Test handling of edge cases and invalid inputs."""
     # Empty DataFrame

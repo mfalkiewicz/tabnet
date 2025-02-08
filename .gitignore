@@ -155,3 +155,6 @@ __pycache__/
 dist/
 build/
 .aider*
+
+mlruns/*
+metadata/*

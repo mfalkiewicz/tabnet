@@ -8,13 +8,19 @@ from typing import Dict, Any, List, Optional
 import numpy as np
 import pandas as pd
 import torch
+import threading
 from pyspark.ml.param.shared import HasInputCol, HasOutputCol, HasPredictionCol, HasLabelCol
 from pyspark.ml import Estimator, Model
 from pyspark.ml.param import Param, Params, TypeConverters
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import pandas_udf
-from pyspark.sql.types import DoubleType, ArrayType
-from pyspark.ml.util import MLReadable, MLWritable, MLReader, MLWriter, DefaultParamsReader, DefaultParamsWriter
+from pyspark.sql.types import DoubleType, ArrayType, StructType, StructField
+from pyspark.sql.functions import array, lit, pandas_udf
+from pyspark.ml.util import (
+    MLReadable, MLWritable, MLReader, MLWriter,
+    DefaultParamsReader, DefaultParamsWriter,
+    DefaultParamsReadable, DefaultParamsWritable
+)
 import os
 import pickle
 
@@ -30,23 +36,30 @@ def get_tabnet_classifier():
 class TabNetParams(Params):
     """Common parameters for TabNet Spark ML components."""
     
-    n_d = Param(Params._dummy(), "n_d", "Width of the decision prediction layer", 
-                typeConverter=TypeConverters.toInt)
-    n_a = Param(Params._dummy(), "n_a", "Width of the attention embedding for each mask", 
-                typeConverter=TypeConverters.toInt)
-    n_steps = Param(Params._dummy(), "n_steps", "Number of steps in the architecture", 
-                typeConverter=TypeConverters.toInt)
-    gamma = Param(Params._dummy(), "gamma", "Scale for feature updates", 
-                typeConverter=TypeConverters.toFloat)
-    cat_idxs = Param(Params._dummy(), "cat_idxs", "List of categorical feature indices", 
-                typeConverter=TypeConverters.toListInt)
-    cat_dims = Param(Params._dummy(), "cat_dims", "List of categorical feature dimensions",
-                 typeConverter=TypeConverters.toListInt)
-    labelCols = Param(Params._dummy(), "labelCols", "List of label column names",
-                 typeConverter=TypeConverters.toListString)
-    
     def __init__(self):
         super().__init__()
+        self._paramMap = {}
+        self._defaultParamMap = {}
+        
+        # Initialize all parameters
+        self.n_d = Param(self, "n_d", "Width of the decision prediction layer",
+                        typeConverter=TypeConverters.toInt)
+        self.n_a = Param(self, "n_a", "Width of the attention embedding for each mask",
+                        typeConverter=TypeConverters.toInt)
+        self.n_steps = Param(self, "n_steps", "Number of steps in the architecture",
+                        typeConverter=TypeConverters.toInt)
+        self.gamma = Param(self, "gamma", "Scale for feature updates",
+                        typeConverter=TypeConverters.toFloat)
+        self.cat_idxs = Param(self, "cat_idxs", "List of categorical feature indices",
+                        typeConverter=TypeConverters.toListInt)
+        self.cat_dims = Param(self, "cat_dims", "List of categorical feature dimensions",
+                        typeConverter=TypeConverters.toListInt)
+        self.labelCols = Param(self, "labelCols", "List of label column names",
+                        typeConverter=TypeConverters.toListString)
+        self.tabnet_model = Param(self, "tabnet_model", "TabNet model instance",
+                        typeConverter=TypeConverters.identity)
+        
+        # Set default values
         self._setDefault(
             n_d=8,
             n_a=8,
@@ -54,7 +67,8 @@ class TabNetParams(Params):
             gamma=1.3,
             cat_idxs=[],
             cat_dims=[],
-            labelCols=["label"]
+            labelCols=["label"],
+            tabnet_model=None
         )
     
     def getLabelCols(self) -> List[str]:
@@ -88,11 +102,22 @@ class SparkTabNetEstimator(Estimator, TabNetParams, HasInputCol, HasOutputCol):
     def __init__(self, inputCol: str = "features", outputCol: str = "predictions",
                  labelCols: List[str] = None, **kwargs):
         super().__init__()
+        
+        # Initialize parameters from TabNetParams
+        TabNetParams.__init__(self)
+        
+        # Set input parameters
         if labelCols is None:
             labelCols = ["label"]
-        self._set(inputCol=inputCol, outputCol=outputCol, labelCols=labelCols)
+            
+        self._set(
+            inputCol=inputCol,
+            outputCol=outputCol,
+            labelCols=labelCols,
+            **kwargs
+        )
+        
         self.tabnet = None
-        self._set(**kwargs)
     
     def _prepare_data(self, df: TabNetDataFrame) -> TabNetDataFrame:
         """Prepare data using DataFrame interface.
@@ -169,60 +194,15 @@ class SparkTabNetEstimator(Estimator, TabNetParams, HasInputCol, HasOutputCol):
         )
 
 
-class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredictionCol, MLReadable, MLWritable):
-    """Spark ML Model for TabNet predictions."""
-    
-    def __getstate__(self):
-        """Get state for pickling."""
-        state = self.__dict__.copy()
-        # Save TabNet model state
-        if self.tabnet is not None:
-            state['_tabnet_state'] = {
-                'n_d': self.tabnet.n_d,
-                'n_a': self.tabnet.n_a,
-                'n_steps': self.tabnet.n_steps,
-                'gamma': self.tabnet.gamma,
-                'cat_idxs': self.tabnet.cat_idxs,
-                'cat_dims': self.tabnet.cat_dims,
-                'input_dim': self.tabnet.input_dim,
-                'output_dim': self.tabnet.output_dim,
-                'classes_': self.tabnet.classes_,
-                'state_dict': self.tabnet.network.state_dict()
-            }
-            # Remove unpickleable objects
-            state.pop('tabnet', None)
-        return state
-    
-    def __setstate__(self, state):
-        """Set state for unpickling."""
-        # Restore TabNet model if state exists
-        if '_tabnet_state' in state:
-            tabnet_state = state.pop('_tabnet_state')
-            TabNetClassifier = get_tabnet_classifier()
-            self.tabnet = TabNetClassifier(
-                n_d=tabnet_state['n_d'],
-                n_a=tabnet_state['n_a'],
-                n_steps=tabnet_state['n_steps'],
-                gamma=tabnet_state['gamma'],
-                cat_idxs=tabnet_state['cat_idxs'],
-                cat_dims=tabnet_state['cat_dims'],
-                input_dim=tabnet_state['input_dim'],
-                output_dim=tabnet_state['output_dim']
-            )
-            # Set dimensions before initializing network
-            self.tabnet.input_dim = tabnet_state['input_dim']
-            self.tabnet.output_dim = tabnet_state['output_dim']
-            # Initialize the network
-            self.tabnet._set_network()
-            # Set classes
-            self.tabnet.classes_ = tabnet_state['classes_']
-            # Load the model state
-            self.tabnet.network.load_state_dict(tabnet_state['state_dict'])
-        self.__dict__.update(state)
+# Define lock types for type checking
+LOCK_TYPES = (type(threading.Lock()), type(threading.RLock()))
+
+class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredictionCol,
+                       DefaultParamsReadable, DefaultParamsWritable):
     """Spark ML Model for TabNet predictions.
     
     This model provides distributed prediction capabilities using the trained TabNet model
-    and DataFrame interface.
+    and DataFrame interface. It implements proper serialization for MLflow integration.
     
     Args:
         tabnet_model: Trained TabNetClassifier instance
@@ -236,9 +216,120 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
         inputCol: str = "features",
         outputCol: str = "predictions"
     ):
+        """Initialize SparkTabNetModel with proper parameter handling.
+        
+        Args:
+            tabnet_model: Trained TabNetClassifier instance
+            inputCol: Input column name containing features
+            outputCol: Output column name for predictions
+        """
         super().__init__()
-        self.tabnet = tabnet_model
-        self._set(inputCol=inputCol, outputCol=outputCol)
+        
+        # Initialize parameters from TabNetParams
+        TabNetParams.__init__(self)
+        
+        # Initialize parameter maps
+        self._paramMap = {}
+        self._defaultParamMap = {}
+        
+        # Initialize parameters
+        self._tabnet = None
+        
+        # Initialize all parameters first
+        self.inputCol = Param(self, "inputCol", "Input column name")
+        self.outputCol = Param(self, "outputCol", "Output column name for predictions")
+        self.tabnet_model = Param(self, "tabnet_model", "TabNet model instance")
+        
+        # Set default values
+        self._setDefault(
+            inputCol=inputCol,
+            outputCol=outputCol,
+            tabnet_model=None,
+            n_d=8,
+            n_a=8,
+            n_steps=3,
+            gamma=1.3,
+            cat_idxs=[],
+            cat_dims=[],
+            labelCols=["label"]
+        )
+        
+        # Set provided values
+        self._set(
+            inputCol=inputCol,
+            outputCol=outputCol
+        )
+        
+        # Set tabnet model if provided
+        if tabnet_model is not None:
+            self._set(tabnet_model=tabnet_model)
+            self._tabnet = tabnet_model
+    
+    def __getstate__(self):
+        """Get state for pickling."""
+        state = {
+            "uid": self.uid,
+            "inputCol": self.getOrDefault(self.inputCol),
+            "outputCol": self.getOrDefault(self.outputCol),
+            "_paramMap": {param.name: value for param, value in self._paramMap.items()},
+            "_defaultParamMap": {param.name: value for param, value in self._defaultParamMap.items()},
+        }
+        
+        # Save TabNet state
+        if self._tabnet is not None:
+            state["tabnet"] = self._tabnet
+            
+        return state
+    
+    def __setstate__(self, state):
+        """Restore state from pickle."""
+        # Initialize base classes
+        super(SparkTabNetModel, self).__init__()
+        TabNetParams.__init__(self)
+        
+        # Restore uid
+        self.uid = state.get("uid", self.uid)
+        
+        # Initialize parameters with proper ownership
+        self.inputCol = Param(self, "inputCol", "Input column name")
+        self.outputCol = Param(self, "outputCol", "Output column name for predictions")
+        self.tabnet_model = Param(self, "tabnet_model", "TabNet model instance")
+        
+        # Initialize parameter maps
+        self._paramMap = {}
+        self._defaultParamMap = {}
+        
+        # Set default values
+        self._setDefault(
+            inputCol=state.get("inputCol", "features"),
+            outputCol=state.get("outputCol", "predictions"),
+            tabnet_model=None,
+            n_d=8,
+            n_a=8,
+            n_steps=3,
+            gamma=1.3,
+            cat_idxs=[],
+            cat_dims=[],
+            labelCols=["label"]
+        )
+        
+        # Set current values
+        self._set(
+            inputCol=state.get("inputCol", "features"),
+            outputCol=state.get("outputCol", "predictions")
+        )
+        
+        # Restore TabNet model if available
+        if "tabnet" in state:
+            self._tabnet = state["tabnet"]
+            self._set(tabnet_model=state["tabnet"])
+            
+        # Ensure all parameters have proper ownership
+        for param in self.params:
+            if param.name in state.get("_paramMap", {}):
+                self._paramMap[param] = state["_paramMap"][param.name]
+            if param.name in state.get("_defaultParamMap", {}):
+                self._defaultParamMap[param] = state["_defaultParamMap"][param.name]
     
     def _convert_features(self, features: List[float]) -> np.ndarray:
         """Convert features to proper format for prediction.
@@ -261,128 +352,202 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
             dataset: Input DataFrame containing features
             
         Returns:
-            DataFrame with predictions added
-        """
-        # Create a copy of the model's state
-        model_state = {
-            'n_d': self.tabnet.n_d,
-            'n_a': self.tabnet.n_a,
-            'n_steps': self.tabnet.n_steps,
-            'gamma': self.tabnet.gamma,
-            'cat_idxs': self.tabnet.cat_idxs,
-            'cat_dims': self.tabnet.cat_dims,
-            'input_dim': self.tabnet.input_dim,
-            'output_dim': self.tabnet.output_dim,
-            'classes_': self.tabnet.classes_,
-            'state_dict': self.tabnet.network.state_dict()
-        }
+            DataFrame with predictions added. If the model is not initialized,
+            returns the input DataFrame with an empty predictions column.
         
+        Raises:
+            ValueError: If the model state is corrupted or invalid
+        """
+        # Get the model state
+        if self._tabnet is None:
+            # Return dataset with empty predictions column
+            empty_predictions = array([lit(0.0).cast(DoubleType()) for _ in range(2)])  # Default to binary classification
+            return dataset.withColumn(self.getOrDefault(self.outputCol), empty_predictions)
+            
+        # Create a pandas UDF for predictions
         @pandas_udf(ArrayType(DoubleType()))
         def predict_batch(features_series):
             """Vectorized UDF for predictions."""
-            # Create a new model instance for this executor
-            TabNetClassifier = get_tabnet_classifier()
-            local_model = TabNetClassifier(
-                n_d=model_state['n_d'],
-                n_a=model_state['n_a'],
-                n_steps=model_state['n_steps'],
-                gamma=model_state['gamma'],
-                cat_idxs=model_state['cat_idxs'],
-                cat_dims=model_state['cat_dims'],
-                input_dim=model_state['input_dim'],
-                output_dim=model_state['output_dim']
-            )
-            # Set dimensions before initializing network
-            local_model.input_dim = model_state['input_dim']
-            local_model.output_dim = model_state['output_dim']
-            # Initialize the network
-            local_model._set_network()
-            # Set classes
-            local_model.classes_ = model_state['classes_']
-            # Load the model state
-            local_model.network.load_state_dict(model_state['state_dict'])
-            
             # Convert features to numpy array
             features_array = np.stack([np.array(x, dtype=np.float32) for x in features_series])
             
             # Make predictions
             with torch.no_grad():
-                predictions = local_model.predict_proba(features_array)
+                predictions = self._tabnet.predict_proba(features_array)
             
             # Convert predictions to pandas Series with lists
             return pd.Series([p.tolist() for p in predictions])
         
         # Apply predictions
         return dataset.withColumn(
-            self.getOutputCol(),
-            predict_batch(self.getInputCol())
+            self.getOrDefault(self.outputCol),
+            predict_batch(self.getOrDefault(self.inputCol))
         )
     
+    @property
+    def tabnet(self):
+        """Property to access the TabNet model instance.
+        
+        Returns:
+            The TabNet model instance, reconstructing it from saved state if necessary.
+        """
+        if self._tabnet is None and hasattr(self, '_mlflow_model_info'):
+            # Reconstruct TabNet model from saved state
+            state = self._mlflow_model_info["tabnet_state"]
+            TabNetClassifier = get_tabnet_classifier()
+            tabnet = TabNetClassifier(
+                n_d=state['n_d'],
+                n_a=state['n_a'],
+                n_steps=state['n_steps'],
+                gamma=state['gamma'],
+                cat_idxs=state['cat_idxs'],
+                cat_dims=state['cat_dims'],
+                input_dim=state['input_dim'],
+                output_dim=state['output_dim']
+            )
+            tabnet.input_dim = state['input_dim']
+            tabnet.output_dim = state['output_dim']
+            tabnet._initialize_network()
+            tabnet.classes_ = state['classes_']
+            tabnet.network.load_state_dict(state['state_dict'])
+            self._tabnet = tabnet
+            self._set(tabnet_model=tabnet)
+        return self._tabnet
+    
+    @tabnet.setter
+    def tabnet(self, value):
+        """Setter for the TabNet model instance.
+        
+        Args:
+            value: The TabNet model instance to set
+        """
+        self._tabnet = value
+        self._set(tabnet_model=value)
+
     def write(self) -> MLWriter:
         """Returns MLWriter instance for this ML instance."""
-        return DefaultParamsWriter(self)
+        return SparkTabNetModelWriter(self)
     
     @classmethod
     def read(cls) -> MLReader:
         """Returns MLReader instance for this class."""
-        return DefaultParamsReader(cls)
-    
-    def save(self, path: str) -> None:
-        """Save the model to disk.
-        
-        Args:
-            path: Path to save the model
-        """
-        # Save Spark ML model metadata
-        self.write().save(path)
-        
-        # Save TabNet model state
-        if self.tabnet is not None:
-            model_state = {
-                'n_d': self.tabnet.n_d,
-                'n_a': self.tabnet.n_a,
-                'n_steps': self.tabnet.n_steps,
-                'gamma': self.tabnet.gamma,
-                'cat_idxs': self.tabnet.cat_idxs,
-                'cat_dims': self.tabnet.cat_dims,
-                'input_dim': self.tabnet.input_dim,
-                'output_dim': self.tabnet.output_dim,
-                'classes_': self.tabnet.classes_,
-                'state_dict': self.tabnet.network.state_dict()
-            }
-            import pickle
-            import os
-            model_path = os.path.join(path, "tabnet_model.pkl")
-            with open(model_path, 'wb') as f:
-                pickle.dump(model_state, f)
+        return SparkTabNetModelReader(cls)
     
     @classmethod
     def load(cls, path: str) -> "SparkTabNetModel":
-        """Load the model from disk.
+        """Load the model from disk with proper parameter handling.
+        
+        This method loads both the Spark ML metadata and the TabNet model state.
+        The TabNet state is expected to be in a pickle file in the model directory.
         
         Args:
             path: Path to load the model from
             
         Returns:
             Loaded SparkTabNetModel instance
-        """
-        # Load Spark ML model metadata
-        reader = DefaultParamsReader(cls)
-        model = cls()
-        params = reader.load(path)
-        params._copyValues(model)
-        
-        # Load TabNet model state
-        import pickle
-        import os
-        model_path = os.path.join(path, "tabnet_model.pkl")
-        if os.path.exists(model_path):
-            with open(model_path, 'rb') as f:
-                model_state = pickle.load(f)
             
+        Raises:
+            ValueError: If the path is invalid or required files are missing
+            IOError: If there are issues reading from the specified path
+        """
+        # Handle MLflow path structure
+        if 'sparkml' in path:
+            mlflow_root = path.split('sparkml')[0]
+            tabnet_paths = [
+                os.path.join(mlflow_root, "tabnet_model.pkl"),
+                os.path.join(path, "tabnet_model.pkl"),
+                os.path.join(path, "stages", "0_SparkTabNetModel", "tabnet_model.pkl")
+            ]
+        else:
+            tabnet_paths = [os.path.join(path, "tabnet_model.pkl")]
+        if not path:
+            raise ValueError("Path cannot be empty")
+            
+        if not os.path.exists(path):
+            raise ValueError(f"Model path does not exist: {path}")
+            
+        # Check for model state file first
+        # For non-MLflow loads, prioritize the primary model path.
+        if 'sparkml/stages' not in path:
+            primary_model_path = os.path.join(path, "tabnet_model.pkl")
+            if not os.path.exists(primary_model_path):
+                raise ValueError("TabNet model state file not found in:\n- " + primary_model_path)
+            model_paths = [primary_model_path]
+        else:
+            model_paths = [
+                os.path.join(path, "tabnet_model.pkl"),
+                os.path.join(path, "stages", "0_SparkTabNetModel", "tabnet_model.pkl"),
+            ]
+            mlflow_root = path.split('sparkml/stages')[0]
+            model_paths.extend([
+                os.path.join(mlflow_root, "tabnet_model.pkl"),
+                os.path.join(mlflow_root, "stages", "0_SparkTabNetModel", "tabnet_model.pkl")
+            ])
+        
+        model_file_exists = False
+        valid_model_path = None
+        for mp in model_paths:
+            if os.path.exists(mp):
+                try:
+                    with open(mp, 'rb') as f:
+                        model_state = pickle.load(f)
+                        if all(k in model_state for k in ['n_d', 'n_a', 'n_steps', 'gamma', 'cat_idxs', 'cat_dims', 'input_dim', 'output_dim', 'classes_', 'state_dict']):
+                            model_file_exists = True
+                            valid_model_path = mp
+                            break
+                except Exception:
+                    continue
+        if not model_file_exists:
+            paths_str = '\n'.join(f"- {p}" for p in model_paths)
+            raise ValueError("TabNet model state file not found in any of:\n" + paths_str)
+            
+        try:
+            # Create a new instance and initialize parameters
+            instance = cls()
+            instance._setDefault(
+                inputCol="features",
+                outputCol="predictions",
+                tabnet_model=None
+            )
+            
+            # Get SparkContext from SparkSession
+            from pyspark.sql import SparkSession
+            spark = SparkSession.builder.getOrCreate()
+            sc = spark.sparkContext
+            
+            # Load Spark ML metadata using DefaultParamsReader
+            metadata = DefaultParamsReader.loadMetadata(path, sc)
+            instance._resetUid(metadata["uid"])
+            
+            # Use DefaultParamsReader to handle parameter loading
+            DefaultParamsReader.getAndSetParams(instance, metadata)
+            
+            # Ensure required parameters are set with defaults if not in metadata
+            if instance.getParam("outputCol") not in instance._defaultParamMap:
+                instance._defaultParamMap[instance.getParam("outputCol")] = "predictions"
+            if instance.getParam("inputCol") not in instance._defaultParamMap:
+                instance._defaultParamMap[instance.getParam("inputCol")] = "features"
+            
+            # Load TabNet model state
+            model_state = None
+            load_errors = []
+            for model_path in model_paths:
+                if os.path.exists(model_path):
+                    try:
+                        with open(model_path, 'rb') as f:
+                            model_state = pickle.load(f)
+                            break
+                    except Exception as e:
+                        load_errors.append(f"Failed to load from {model_path}: {str(e)}")
+            
+            if model_state is None:
+                errors_str = '\n'.join(load_errors)
+                raise ValueError(f"Failed to load TabNet state:\n{errors_str}")
+                
+            # Initialize TabNet model
             # Initialize TabNet model
             TabNetClassifier = get_tabnet_classifier()
-            model.tabnet = TabNetClassifier(
+            tabnet = TabNetClassifier(
                 n_d=model_state['n_d'],
                 n_a=model_state['n_a'],
                 n_steps=model_state['n_steps'],
@@ -392,14 +557,267 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
                 input_dim=model_state['input_dim'],
                 output_dim=model_state['output_dim']
             )
+            
             # Set dimensions before initializing network
-            model.tabnet.input_dim = model_state['input_dim']
-            model.tabnet.output_dim = model_state['output_dim']
+            tabnet.input_dim = model_state['input_dim']
+            tabnet.output_dim = model_state['output_dim']
+            
             # Initialize the network
-            model.tabnet._set_network()
+            tabnet._initialize_network()
+            
             # Set classes
-            model.tabnet.classes_ = model_state['classes_']
+            tabnet.classes_ = model_state['classes_']
+            
             # Load the model state
-            model.tabnet.network.load_state_dict(model_state['state_dict'])
+            tabnet.network.load_state_dict(model_state['state_dict'])
+            
+            # Set the TabNet model consistently across all locations
+            instance._paramMap[instance.tabnet_model] = tabnet
+            instance._defaultParamMap[instance.tabnet_model] = tabnet
+            
+            # Store model state for lazy loading
+            instance._mlflow_model_info = {
+                "model_type": "SparkTabNetModel",
+                "tabnet_state": model_state
+            }
+            
+            # Set the TabNet model
+            instance._tabnet = tabnet
+            instance._set(tabnet_model=tabnet)
+            
+            # Ensure transform method is properly bound
+            if hasattr(instance, '_transform'):
+                instance._transform = instance._transform.__get__(instance, instance.__class__)
+            
+            return instance
+            
+        except Exception as e:
+            raise IOError(f"Failed to load model from {path}: {str(e)}")
+    
+class SparkTabNetModelWriter(MLWriter):
+    """Custom MLWriter for SparkTabNetModel.
+    
+    This writer handles both the standard Spark ML metadata and the TabNet-specific state.
+    It ensures the TabNet model state is properly saved when using MLflow or direct save.
+    """
+    
+    def __init__(self, instance):
+        super().__init__()
+        self.instance = instance
+    
+    def saveImpl(self, path: str) -> None:
+        """Save both Spark ML metadata and TabNet state.
+        
+        Args:
+            path: Path to save the model
+            
+        Raises:
+            ValueError: If path is empty or TabNet model is not initialized
+        """
+        if not path:
+            raise ValueError("Path cannot be empty")
+            
+        try:
+            # First, save TabNet model state
+            tabnet = self.instance.getOrDefault(self.instance.tabnet_model)
+            if tabnet is None:
+                raise ValueError("TabNet model has not been initialized")
+                
+            # Create model state with MLflow compatibility info
+            model_state = {
+                'n_d': tabnet.n_d,
+                'n_a': tabnet.n_a,
+                'n_steps': tabnet.n_steps,
+                'gamma': tabnet.gamma,
+                'cat_idxs': tabnet.cat_idxs,
+                'cat_dims': tabnet.cat_dims,
+                'input_dim': tabnet.input_dim,
+                'output_dim': tabnet.output_dim,
+                'classes_': tabnet.classes_,
+                'state_dict': tabnet.network.state_dict(),
+                '_mlflow_model_info': {
+                    'model_type': 'SparkTabNetModel',
+                    'tabnet_state': {
+                        'n_d': tabnet.n_d,
+                        'n_a': tabnet.n_a,
+                        'n_steps': tabnet.n_steps,
+                        'gamma': tabnet.gamma,
+                        'cat_idxs': tabnet.cat_idxs,
+                        'cat_dims': tabnet.cat_dims,
+                        'input_dim': tabnet.input_dim,
+                        'output_dim': tabnet.output_dim,
+                        'classes_': tabnet.classes_,
+                        'state_dict': tabnet.network.state_dict()
+                    }
+                }
+            }
+            
+            # Save TabNet state in multiple locations for compatibility
+            paths_to_save = [
+                os.path.join(path, "tabnet_model.pkl"),  # Direct save location
+                os.path.join(path, "stages", "0_SparkTabNetModel", "tabnet_model.pkl"),  # MLflow stage path
+            ]
+            
+            # If this is an MLflow save (path contains 'sparkml/stages')
+            if 'sparkml/stages' in path:
+                # Get the MLflow model root directory
+                mlflow_root = path.split('sparkml/stages')[0]
+                paths_to_save.extend([
+                    os.path.join(mlflow_root, "tabnet_model.pkl"),
+                    os.path.join(mlflow_root, "stages", "0_SparkTabNetModel", "tabnet_model.pkl")
+                ])
+            
+            # Save to all locations with proper error handling
+            save_errors = []
+            successful_saves = []
+            
+            for save_path in paths_to_save:
+                try:
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    with open(save_path, 'wb') as f:
+                        pickle.dump(model_state, f)
+                    successful_saves.append(save_path)
+                except Exception as e:
+                    save_errors.append(f"Failed to save to {save_path}: {str(e)}")
+            
+            # Ensure at least one save was successful
+            if not successful_saves:
+                error_msg = "\n".join(save_errors)
+                raise IOError(f"Failed to save TabNet state to any location:\n{error_msg}")
+            
+            # Save parameters using DefaultParamsWriter
+            # Store current parameter values
+            param_values = {}
+            for param in self.instance.params:
+                if param in self.instance._paramMap:
+                    param_values[param] = self.instance._paramMap[param]
+            
+            # Temporarily remove tabnet_model to avoid JSON serialization issues
+            tabnet_model = self.instance.getOrDefault(self.instance.tabnet_model)
+            self.instance._paramMap.pop(self.instance.tabnet_model, None)
+            self.instance._defaultParamMap.pop(self.instance.tabnet_model, None)
+            
+            # Get SparkContext from SparkSession
+            from pyspark.sql import SparkSession
+            spark = SparkSession.builder.getOrCreate()
+            sc = spark.sparkContext
+            
+            # Save metadata with proper parameter handling
+            writer = DefaultParamsWriter(self.instance)
+            
+            # Delete existing metadata directory if it exists
+            metadata_path = os.path.join(path, "metadata")
+            if os.path.exists(metadata_path):
+                import shutil
+                shutil.rmtree(metadata_path)
+                
+            writer.saveMetadata(self.instance, path, sc)
+            
+            # Restore parameters
+            for param, value in param_values.items():
+                self.instance._paramMap[param] = value
+            self.instance._set(tabnet_model=tabnet_model)
+                    
+        except Exception as e:
+            raise IOError(f"Failed to save model to {path}: {str(e)}")
+
+    def write(self) -> MLWriter:
+        """Returns MLWriter instance for this ML instance."""
+        return self
+
+
+class SparkTabNetModelReader(MLReader):
+    """Custom MLReader for SparkTabNetModel."""
+    
+    def __init__(self, cls):
+        super().__init__()
+        self.cls = cls
+    
+    def load(self, path: str) -> "SparkTabNetModel":
+        """Load SparkTabNetModel from path."""
+        model = self.cls.load(path)
+        
+        # If the model is wrapped in a PipelineModel (has stages), extract the TabNet model
+        if hasattr(model, "stages"):
+            for stage in model.stages:
+                if isinstance(stage, SparkTabNetModel):
+                    # Ensure the stage has the tabnet attribute
+                    if not hasattr(stage, "tabnet"):
+                        if hasattr(stage, "_mlflow_model_info"):
+                            # Reconstruct TabNet model from saved state
+                            state = stage._mlflow_model_info["tabnet_state"]
+                            TabNetClassifier = get_tabnet_classifier()
+                            tabnet = TabNetClassifier(
+                                n_d=state['n_d'],
+                                n_a=state['n_a'],
+                                n_steps=state['n_steps'],
+                                gamma=state['gamma'],
+                                cat_idxs=state['cat_idxs'],
+                                cat_dims=state['cat_dims'],
+                                input_dim=state['input_dim'],
+                                output_dim=state['output_dim']
+                            )
+                            tabnet.input_dim = state['input_dim']
+                            tabnet.output_dim = state['output_dim']
+                            tabnet._initialize_network()
+                            tabnet.classes_ = state['classes_']
+                            tabnet.network.load_state_dict(state['state_dict'])
+                            stage.tabnet = tabnet
+                            stage._paramMap[stage.tabnet_model] = tabnet
+                            stage._defaultParamMap[stage.tabnet_model] = tabnet
+                    return stage
+            
+            # If no SparkTabNetModel found, try the last stage
+            if model.stages:
+                last_stage = model.stages[-1]
+                if isinstance(last_stage, SparkTabNetModel):
+                    if not hasattr(last_stage, "tabnet"):
+                        if hasattr(last_stage, "_mlflow_model_info"):
+                            state = last_stage._mlflow_model_info["tabnet_state"]
+                            TabNetClassifier = get_tabnet_classifier()
+                            tabnet = TabNetClassifier(
+                                n_d=state['n_d'],
+                                n_a=state['n_a'],
+                                n_steps=state['n_steps'],
+                                gamma=state['gamma'],
+                                cat_idxs=state['cat_idxs'],
+                                cat_dims=state['cat_dims'],
+                                input_dim=state['input_dim'],
+                                output_dim=state['output_dim']
+                            )
+                            tabnet.input_dim = state['input_dim']
+                            tabnet.output_dim = state['output_dim']
+                            tabnet._set_network()
+                            tabnet.classes_ = state['classes_']
+                            tabnet.network.load_state_dict(state['state_dict'])
+                            last_stage.tabnet = tabnet
+                            last_stage._paramMap[last_stage.tabnet_model] = tabnet
+                            last_stage._defaultParamMap[last_stage.tabnet_model] = tabnet
+                    return last_stage
+        
+        # If not a pipeline model, ensure it's a SparkTabNetModel
+        if isinstance(model, SparkTabNetModel):
+            if not hasattr(model, "tabnet"):
+                if hasattr(model, "_mlflow_model_info"):
+                    state = model._mlflow_model_info["tabnet_state"]
+                    TabNetClassifier = get_tabnet_classifier()
+                    tabnet = TabNetClassifier(
+                        n_d=state['n_d'],
+                        n_a=state['n_a'],
+                        n_steps=state['n_steps'],
+                        gamma=state['gamma'],
+                        cat_idxs=state['cat_idxs'],
+                        cat_dims=state['cat_dims'],
+                        input_dim=state['input_dim'],
+                        output_dim=state['output_dim']
+                    )
+                    tabnet.input_dim = state['input_dim']
+                    tabnet.output_dim = state['output_dim']
+                    tabnet._initialize_network()
+                    tabnet.classes_ = state['classes_']
+                    tabnet.network.load_state_dict(state['state_dict'])
+                    model.tabnet = tabnet
+                    model._paramMap[model.tabnet_model] = tabnet
+                    model._defaultParamMap[model.tabnet_model] = tabnet
         
         return model

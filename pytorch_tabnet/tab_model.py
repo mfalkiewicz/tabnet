@@ -64,6 +64,12 @@ class TabNetClassifier(TabModel):
                  mask_type="sparsemax",
                  input_dim=None, output_dim=None,
                  device_name="auto", n_shared_decoder=1, n_indep_decoder=1):
+        # Initialize device first to ensure it's available for network initialization
+        self.device_name = device_name
+        if self.device_name == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(self.device_name)
         super(TabNetClassifier, self).__init__(
             n_d=n_d, n_a=n_a, n_steps=n_steps, gamma=gamma,
             cat_idxs=cat_idxs, cat_dims=cat_dims, cat_emb_dim=cat_emb_dim,
@@ -98,26 +104,73 @@ class TabNetClassifier(TabModel):
 
     def __getstate__(self):
         """Return state values to be pickled."""
-        # 1. Validate or remove any non-picklable attributes if needed
-        # 2. Build a dictionary of everything you need to re-create the object
-        state = self.__dict__.copy()
-        # The network's state_dict is safe to pickle, but the device references might not be
-        # so store only the state_dict:
-        state["network_state"] = self.network.state_dict()
-        # Remove the actual network to avoid recursion or device errors
-        del state["network"]
+        # Create a clean state dictionary with only essential attributes
+        state = {
+            "_is_tabnet": True,
+            "device_name": self.device_name,
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "n_d": self.n_d,
+            "n_a": self.n_a,
+            "n_steps": self.n_steps,
+            "gamma": self.gamma,
+            "cat_idxs": self.cat_idxs,
+            "cat_dims": self.cat_dims,
+            "n_independent": self.n_independent,
+            "n_shared": self.n_shared,
+            "epsilon": self.epsilon,
+            "momentum": self.momentum,
+            "mask_type": self.mask_type,
+            "n_shared_decoder": self.n_shared_decoder,
+            "n_indep_decoder": self.n_indep_decoder,
+            "classes_": getattr(self, 'classes_', None),
+            "preds_mapper": getattr(self, 'preds_mapper', None),
+            "_class_map": getattr(self, '_class_map', None),
+            "feature_importances_": getattr(self, 'feature_importances_', None),
+            "_task": getattr(self, '_task', None),
+            "batch_size": getattr(self, 'batch_size', 1024),
+            "virtual_batch_size": getattr(self, 'virtual_batch_size', 128),
+        }
+        
+        # Save network state if it exists
+        if hasattr(self, 'network'):
+            state["network_state"] = self.network.state_dict()
+            
         return state
 
     def __setstate__(self, state):
         """Restore state from pickle."""
-        # 1. Restore all attributes
-        self.__dict__.update(state)
-        # 2. Re-initialize the network
-        self._initialize_network()
-        # 3. Load the state_dict
-        self.network.load_state_dict(self.__dict__["network_state"])
-        # 4. Cleanup
-        del self.__dict__["network_state"]
+        # Initialize an empty instance
+        self.__init__()
+        
+        # Check if this is a TabNet model
+        is_tabnet = state.pop("_is_tabnet", False)
+        if not is_tabnet:
+            raise ValueError("Attempting to load non-TabNet model state")
+            
+        # Get TabNet parameters
+        tabnet_params = state.pop("_tabnet_params", None)
+        if tabnet_params:
+            # Only set non-None parameters
+            for key, value in tabnet_params.items():
+                if value is not None:
+                    setattr(self, key, value)
+                    
+        # Restore remaining attributes, excluding any None values
+        for key, value in state.items():
+            if value is not None:
+                setattr(self, key, value)
+        
+        # Re-initialize the network if we have necessary dimensions
+        if hasattr(self, 'input_dim') and hasattr(self, 'output_dim'):
+            self._initialize_network()
+            
+            # Load the state dict if available
+            if "network_state" in state:
+                self.network.load_state_dict(state["network_state"])
+                
+        # Set tabnet attribute for MLflow compatibility
+        self.tabnet = self
 
     def save_model(self, path):
         """Save model to a pickle file without zipping."""
@@ -569,7 +622,9 @@ class TabNetClassifier(TabModel):
         if self.output_dim is None:
             raise ValueError("Output dimension must be set")
         if not hasattr(self, 'classes_'):
-            raise ValueError("Classes must be determined")
+            self.classes_ = list(range(self.output_dim))
+        elif self.classes_ is None:
+            self.classes_ = list(range(self.output_dim))
         if len(self.classes_) != self.output_dim:
             raise ValueError(f"Number of classes ({len(self.classes_)}) does not match output dimension ({self.output_dim})")
 

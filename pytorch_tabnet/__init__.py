@@ -1,16 +1,9 @@
-try:
-    from ._version import get_versions
+"""TabNet implementation in PyTorch with Spark ML integration."""
 
-    __version__ = get_versions()["version"]
-    del get_versions
-except ImportError:
-    __version__ = "5.0.0"
+import warnings
 
-from .tab_model import TabNetRegressor, TabNetClassifier
-from .tab_network import TabNet
-from . import spark
+# Filter Pydantic deprecation warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="pydantic")
 
-__all__ = ["TabNetRegressor", "TabNetClassifier", "TabNet", "spark", "__version__"]
-
-from . import _version
-__version__ = _version.get_versions()['version']
+# Version of the pytorch-tabnet package
+__version__ = "4.1.0"
