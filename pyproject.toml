@@ -1,6 +1,6 @@
 [project]
 name = "pytorch_tabnet"
-version = "5.0.2"
+version = "5.1.0"
 description = "PyTorch implementation of TabNet"
 readme = "README.md"
 authors = []

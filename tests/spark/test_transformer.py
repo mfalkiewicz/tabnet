@@ -326,43 +326,61 @@ def test_mlflow_integration(spark, tmp_path, test_data):
     estimator = SparkTabNetEstimator(inputCol="features", outputCol="predictions")
     model = estimator.fit(test_data)
 
+    # Set up MLflow tracking
+    mlruns_dir = os.path.join(tmp_path, "mlruns")
+    os.makedirs(mlruns_dir, exist_ok=True)
+    mlflow.set_tracking_uri(f"file://{mlruns_dir}")
+    
+    # Create and set default experiment
+    experiment_name = "Default"
+    if mlflow.get_experiment_by_name(experiment_name) is None:
+        mlflow.create_experiment(experiment_name)
+    mlflow.set_experiment(experiment_name)
+
     # Log model using MLflow
     with mlflow.start_run():
+        # Save TabNet model to a temporary location
+        artifacts_path = str(tmp_path / "artifacts")
+        os.makedirs(artifacts_path, exist_ok=True)
+        tabnet_model_path = os.path.join(artifacts_path, "tabnet_model.pkl")
+        model.save(tabnet_model_path)
+        
+        # Save using MLflow's Python Function flavor to a different location
         model_path = str(tmp_path / "mlflow_model")
-        mlflow.spark.save_model(model, model_path)
+        import shutil
+        if os.path.exists(model_path):
+            shutil.rmtree(model_path)
+        mlflow.pyfunc.save_model(
+            path=model_path,
+            python_model=model,
+            artifacts={
+                "tabnet_model": tabnet_model_path
+            }
+        )
 
-        # Load model using MLflow
-        loaded_model = mlflow.spark.load_model(model_path)
+        # Load model using MLflow and unwrap the Python model
+        mlflow_model = mlflow.pyfunc.load_model(model_path)
+        loaded_model = mlflow_model.unwrap_python_model()
 
         print("\nLoaded model type:", type(loaded_model))
         print("Loaded model attributes:", dir(loaded_model))
-        if hasattr(loaded_model, "stages"):
-            print("Pipeline stages:", [type(stage) for stage in loaded_model.stages])
-            for stage in loaded_model.stages:
-                print(f"Stage type: {type(stage)}")
-                print(f"Stage attributes: {dir(stage)}")
-                if hasattr(stage, "_mlflow_model_info"):
-                    print("Stage MLflow info:", stage._mlflow_model_info)
 
-        # Verify predictions
+        # Get features from test data
+        features = test_data.select("features").toPandas()
+        
+        # Get predictions from original model
         original_preds = model.transform(test_data).select("predictions").collect()
-        loaded_preds = loaded_model.transform(test_data).select("predictions").collect()
+        original_preds = np.array([row.predictions for row in original_preds])
 
-        for orig, loaded in zip(original_preds, loaded_preds):
-            np.testing.assert_array_almost_equal(orig.predictions, loaded.predictions)
+        # Get predictions from loaded model using MLflow's predict interface
+        loaded_preds = mlflow_model.predict(features)
 
-        # Instead of asserting a top-level 'tabnet', extract the SparkTabNetModel stage.
-        if hasattr(loaded_model, "stages"):
-            spark_tabnet_stage = None
-            for stage in loaded_model.stages:
-                if hasattr(stage, "tabnet"):
-                    spark_tabnet_stage = stage
-                    break
-            assert spark_tabnet_stage is not None, "SparkTabNetModel stage not found in loaded pipeline"
-            assert spark_tabnet_stage.tabnet is not None, "SparkTabNetModel stage missing tabnet attribute"
-        else:
-            # For non-pipeline models, assert directly.
-            assert hasattr(loaded_model, 'tabnet') and loaded_model.tabnet is not None, "Loaded model tabnet attribute missing"
+        # Compare predictions
+        np.testing.assert_array_almost_equal(original_preds, loaded_preds)
+
+        # Verify the loaded model is a SparkTabNetModel
+        assert isinstance(loaded_model, SparkTabNetModel), "Loaded model is not a SparkTabNetModel"
+        assert loaded_model._tabnet is not None, "Loaded model _tabnet attribute is missing"
 
 
 def test_edge_cases(spark, test_data):

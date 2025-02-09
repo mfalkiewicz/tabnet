@@ -158,3 +158,13 @@ build/
 
 mlruns/*
 metadata/*
+docs/adr/*
+cline_docs/*
+
+
+*.lock
+.clinerules
+.DS_Store
+.pdm*
+requirements.txt
+poetry.lock
