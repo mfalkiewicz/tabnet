@@ -136,45 +136,102 @@ class LocalStorage(BaseStorage):
             logger.warning(f"Failed to delete {path}: {e}")
 
 class MLflowStorage(BaseStorage):
-    """MLflow artifact storage implementation."""
+    """MLflow artifact storage implementation with Fabric compatibility."""
     
     def __init__(self, base_path: str, **kwargs):
         super().__init__(base_path)
         self.client = mlflow.tracking.MlflowClient()
         self.temp_dir = tempfile.mkdtemp()
+        self._setup_mlflow_context()
+        
+    def _setup_mlflow_context(self):
+        """Setup MLflow context and determine artifact root."""
+        try:
+            # Get current run context if available
+            current_run = mlflow.active_run()
+            if current_run:
+                self.run_id = current_run.info.run_id
+                self.artifact_root = mlflow.get_artifact_uri()
+            else:
+                # Try to extract run ID from base path
+                if self.base_path.startswith("mlflow://"):
+                    self.run_id = self.base_path.split("mlflow://")[1].split("/")[0]
+                    self.artifact_root = mlflow.get_artifact_uri(self.run_id)
+                else:
+                    # Use base path as artifact root
+                    self.run_id = None
+                    self.artifact_root = self.base_path
+        except Exception as e:
+            logger.warning(f"Failed to setup MLflow context: {e}")
+            self.run_id = None
+            self.artifact_root = self.base_path
         
     def _get_artifact_uri(self, path: str) -> str:
         """Get the full artifact URI for a path."""
-        # Convert mlflow:// to runs:/ for proper artifact handling
-        if self.base_path.startswith("mlflow://"):
-            run_id = self.base_path.split("mlflow://")[1].split("/")[0]
-            return f"runs:/{run_id}/{path}"
-        return os.path.join(self.base_path, path)
+        if self.run_id:
+            return f"runs:/{self.run_id}/{path}"
+        elif self.artifact_root.startswith(("wasbs://", "abfss://", "s3://", "gs://")):
+            # Handle cloud storage URIs
+            return os.path.join(self.artifact_root, path)
+        else:
+            # Default to file path
+            return os.path.join(self.base_path, path)
     
     def exists(self, path: str) -> bool:
         try:
             artifact_uri = self._get_artifact_uri(path)
-            # Use MLflow's artifact utilities instead of direct repository access
-            client = mlflow.tracking.MlflowClient()
-            run_id = self.base_path.split("mlflow://")[1].split("/")[0]
             
-            # List artifacts in the run
-            artifacts = client.list_artifacts(run_id)
-            return any(artifact.path == path for artifact in artifacts)
+            if self.run_id:
+                # Use MLflow API for run artifacts
+                try:
+                    artifacts = self.client.list_artifacts(self.run_id)
+                    return any(artifact.path == path for artifact in artifacts)
+                except MlflowException:
+                    # Fallback to direct artifact check
+                    try:
+                        mlflow.artifacts.load_artifact(artifact_uri)
+                        return True
+                    except Exception:
+                        return False
+            else:
+                # Use MLflow's artifact utilities for direct storage
+                try:
+                    mlflow.artifacts.load_artifact(artifact_uri)
+                    return True
+                except Exception:
+                    return False
+                    
         except Exception as e:
             logger.warning(f"Failed to check existence of {path}: {e}")
             return False
     
     def read_bytes(self, path: str) -> bytes:
-        try:
-            local_path = mlflow.artifacts.download_artifacts(
-                artifact_uri=self._get_artifact_uri(path),
-                dst_path=self.temp_dir
-            )
-            with open(local_path, 'rb') as f:
-                return f.read()
-        except Exception as e:
-            raise StorageReadError(f"Failed to read {path} from MLflow: {e}")
+        max_retries = 3
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                artifact_uri = self._get_artifact_uri(path)
+                
+                # Try direct artifact load first
+                try:
+                    return mlflow.artifacts.load_artifact(artifact_uri)
+                except Exception:
+                    # Fallback to download and read
+                    local_path = mlflow.artifacts.download_artifacts(
+                        artifact_uri=artifact_uri,
+                        dst_path=self.temp_dir
+                    )
+                    with open(local_path, 'rb') as f:
+                        return f.read()
+                        
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                
+        raise StorageReadError(f"Failed to read {path} from MLflow after {max_retries} attempts: {last_error}")
     
     def write_bytes(self, path: str, data: bytes) -> None:
         temp_path = os.path.join(self.temp_dir, path)
@@ -185,18 +242,25 @@ class MLflowStorage(BaseStorage):
             with open(temp_path, 'wb') as f:
                 f.write(data)
             
-            # Get run ID
-            run_id = self.base_path.split("mlflow://")[1].split("/")[0]
+            if self.run_id:
+                # Log to MLflow run
+                self.client.log_artifact(
+                    self.run_id,
+                    temp_path,
+                    artifact_path=os.path.dirname(path)
+                )
+            else:
+                # Use direct artifact logging
+                mlflow.log_artifact(temp_path, artifact_path=os.path.dirname(path))
             
-            # Log to MLflow using client
-            self.client.log_artifact(run_id, temp_path, artifact_path=os.path.dirname(path))
-            
-            # Wait for artifact to be available
+            # Verify write with retries
             max_retries = 3
             for attempt in range(max_retries):
                 if self.exists(path):
                     return
-                time.sleep(1)
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+            
             raise StorageWriteError(f"Failed to verify {path} was written to MLflow")
             
         except Exception as e:
@@ -323,8 +387,12 @@ class ModelStorage:
                 # Initialize network
                 model._initialize_network()
                 
-                # Load state dict
-                model.network.load_state_dict(loaded_dict["network_state"])
+                # Load state dict if not empty
+                network_state = loaded_dict.get("network_state", {})
+                if network_state:
+                    model.network.load_state_dict(network_state)
+                else:
+                    logger.warning(f"Empty network state encountered while loading model from {path}. Using initialized weights.")
                 
                 return model
                 

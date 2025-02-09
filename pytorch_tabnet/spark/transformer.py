@@ -9,6 +9,11 @@ import numpy as np
 import pandas as pd
 import torch
 import threading
+import logging
+import tempfile
+import os
+
+logger = logging.getLogger(__name__)
 from pyspark.ml.param.shared import HasInputCol, HasOutputCol, HasPredictionCol, HasLabelCol
 from pyspark.ml import Estimator, Model
 from pyspark.ml.param import Param, Params, TypeConverters
@@ -23,6 +28,7 @@ from pyspark.ml.util import (
 )
 import os
 import pickle
+import time
 import mlflow.pyfunc
 
 from pytorch_tabnet.dataframe import SparkDataFrame, TabNetDataFrame
@@ -489,40 +495,164 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
         """
         if not path:
             raise ValueError("Path cannot be empty")
-            
-        # Check if path exists
-        if not os.path.exists(path):
-            raise ValueError("Model path does not exist")
 
-        # Determine storage backend based on path
+        # Import required modules
         try:
             from pytorch_tabnet.storage import get_storage, ModelStorage, StorageError
+            import mlflow
         except ImportError as e:
-            raise ImportError("Failed to import storage module. This is required for model loading.") from e
+            raise ImportError("Failed to import required modules. MLflow and storage modules are required for model loading.") from e
 
         try:
-            # Convert path to URI if needed
-            if 'sparkml' in path:
-                # Extract run ID from MLflow path if available
+            # Get MLflow context
+            try:
+                mlflow_client = mlflow.tracking.MlflowClient()
+                current_run = mlflow.active_run()
+                if current_run:
+                    run_id = current_run.info.run_id
+                else:
+                    # Try to extract run ID from path
+                    run_id = None
+                    if 'mlruns' in path:
+                        parts = path.split('mlruns')
+                        if len(parts) > 1:
+                            run_parts = parts[1].split('/')
+                            if len(run_parts) > 1:
+                                run_id = run_parts[1]
+            except Exception as e:
+                logger.warning(f"Failed to get MLflow context: {e}")
                 run_id = None
-                if 'mlruns' in path:
-                    parts = path.split('mlruns')
-                    if len(parts) > 1:
-                        run_parts = parts[1].split('/')
-                        if len(run_parts) > 1:
-                            run_id = run_parts[1]
-                
+
+            # Determine appropriate storage URI
+            if 'sparkml' in path:
                 if run_id:
+                    # Use MLflow storage with run ID
                     uri = f"mlflow://{run_id}/{path}"
                 else:
-                    # If no run ID found, use file storage
-                    uri = f"file://{path}"
+                    # In Fabric environment, use MLflow's artifact store
+                    try:
+                        artifact_uri = mlflow.get_artifact_uri()
+                        if artifact_uri:
+                            uri = f"{artifact_uri}/{path}"
+                        else:
+                            uri = f"file://{path}"
+                    except Exception as e:
+                        logger.warning(f"Failed to get MLflow artifact URI: {e}")
+                        uri = f"file://{path}"
             else:
                 uri = f"file://{path}"
+                
+            # Handle MLflow artifact URIs and local paths
+            local_path = None
+            temp_dir = None
 
-            storage = get_storage(uri)
+            # Check if this is a direct MLflow URI
+            if path.startswith("mlflow://"):
+                # Extract run ID and path from MLflow URI
+                run_id = path.split("/")[2]
+                artifact_path = "/".join(path.split("/")[3:])
+
+                # Create temporary directory for artifact download
+                temp_dir = tempfile.mkdtemp()
+                local_path = os.path.join(temp_dir, os.path.basename(path))
+
+                # Try direct download first
+                try:
+                    logger.debug(f"Attempting direct MLflow artifact download from {artifact_path}")
+                    mlflow_client.download_artifacts(run_id, artifact_path, temp_dir)
+                except Exception as e:
+                    logger.warning("Direct MLflow artifact download failed")
+                    logger.warning(f"Failed to download MLflow artifact: {e}")
+                    # Try fallback with artifact store
+                    try:
+                        artifact_uri = mlflow.get_artifact_uri()
+                        if not artifact_uri:
+                            raise ValueError("Could not determine artifact URI")
+
+                        logger.debug(f"Attempting fallback download from artifact store: {artifact_uri}")
+                        artifact_path = os.path.join(artifact_uri, path)
+                        try:
+                            mlflow_client.download_artifacts(run_id, artifact_path, temp_dir)
+                        except Exception as store_e:
+                            store_error_type = str(type(store_e).__name__)
+                            store_error_msg = str(store_e)
+
+                            if "ChecksumException" in store_error_type or "ChecksumException" in store_error_msg:
+                                logger.error("Artifact store fallback failed due to checksum error")
+                                raise ValueError("Direct MLflow artifact download failed") from store_e
+                            raise OSError(f"Artifact store fallback failed: {store_e}")
+                    except ValueError as ve:
+                        raise ve
+                    except Exception as nested_e:
+                        raise ValueError("Model path does not exist and artifact store fallback failed")
+
+                if not os.path.exists(local_path):
+                    raise ValueError(f"MLflow artifact download completed but file not found at {local_path}")
+
+            # Handle local paths and artifact store fallback
+            elif uri.startswith("file://"):
+                local_path = uri[len("file://"):]
+                if not os.path.exists(local_path):
+                    # Try MLflow artifact store fallback
+                    try:
+                        artifact_uri = mlflow.get_artifact_uri()
+                        if not artifact_uri:
+                            raise ValueError("Model path does not exist and no artifact store available")
+
+                        # Create temporary directory for artifact download
+                        temp_dir = tempfile.mkdtemp()
+                        
+                        # Get run ID from active run if available
+                        if current_run:
+                            run_id = current_run.info.run_id
+                            logger.debug(f"Using run ID from active run: {run_id}")
+                        else:
+                            logger.debug("No active run found, attempting to use artifact store without run ID")
+                        logger.debug(f"Attempting artifact store fallback for local path: {path}")
+                        try:
+                            if run_id:
+                                mlflow_client.download_artifacts(run_id, path, temp_dir)
+                            else:
+                                # Try to download without run ID
+                                mlflow_client.download_artifacts(None, path, temp_dir)
+                        except Exception as download_e:
+                            logger.warning(f"Initial download attempt failed: {download_e}")
+                            # Try again with artifact store path
+                            artifact_path = os.path.join(artifact_uri, path)
+                            logger.debug(f"Retrying with artifact store path: {artifact_path}")
+                            mlflow_client.download_artifacts(run_id, artifact_path, temp_dir)
+                            mlflow_client.download_artifacts(None, path, temp_dir)
+
+                        # Check for model files in various possible locations
+                        possible_paths = [
+                            os.path.join(temp_dir, "model"),
+                            os.path.join(temp_dir, os.path.basename(path)),
+                            os.path.join(temp_dir, os.path.basename(path), "model"),
+                            temp_dir
+                        ]
+
+                        # Try to find a valid model directory
+                        local_path = None
+                        for p in possible_paths:
+                            if os.path.exists(p) and os.path.exists(os.path.join(p, "tabnet_model.pkl")):
+                                local_path = p
+                                logger.debug(f"Found model files at: {p}")
+                                break
+
+                        if local_path is None:
+                            logger.error(f"No model files found in downloaded artifacts. Paths checked: {possible_paths}")
+                            raise ValueError("Model path does not exist and artifact store fallback failed")
+                    except Exception as e:
+                        if "ChecksumException" in str(type(e).__name__) or "ChecksumException" in str(e):
+                            logger.error("Artifact store fallback failed due to checksum error")
+                            raise ValueError("Model path does not exist and artifact store fallback failed") from e
+                        raise ValueError("Model path does not exist and artifact store fallback failed") from e
+
+            # Use appropriate storage based on path
+            storage = get_storage(f"file://{local_path}" if local_path else uri)
             model_storage = ModelStorage(storage)
-        
+            instance = None
+
             # Create a new instance
             instance = cls()
             instance._setDefault(
@@ -537,7 +667,9 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
             sc = spark.sparkContext
             
             # Load Spark ML metadata using DefaultParamsReader
-            metadata = DefaultParamsReader.loadMetadata(path, sc)
+            # Use local path for metadata loading to avoid Hadoop filesystem issues
+            metadata_path = local_path if local_path else path
+            metadata = DefaultParamsReader.loadMetadata(metadata_path, sc)
             instance._resetUid(metadata["uid"])
             DefaultParamsReader.getAndSetParams(instance, metadata)
             
@@ -548,9 +680,9 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
                 instance._defaultParamMap[instance.getParam("inputCol")] = "features"
             
             # Check if TabNet model state file exists
-            tabnet_model_path = os.path.join(path, "tabnet_model.pkl")
+            tabnet_model_path = os.path.join(metadata_path, "tabnet_model.pkl")
             if not os.path.exists(tabnet_model_path):
-                raise ValueError("TabNet model state file not found")
+                raise ValueError(f"TabNet model state file not found at {tabnet_model_path}")
     
             # Load TabNet model using storage abstraction
             TabNetClassifier = get_tabnet_classifier()
@@ -559,6 +691,7 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
                     model_class=TabNetClassifier,
                     path=tabnet_model_path
                 )
+                logger.debug(f"Successfully loaded TabNet model from {tabnet_model_path}")
             except Exception as e:
                 raise ValueError(f"Failed to load TabNet model state: {str(e)}")
             
@@ -588,14 +721,26 @@ class SparkTabNetModel(Model, TabNetParams, HasInputCol, HasOutputCol, HasPredic
                 instance._transform = instance._transform.__get__(instance, instance.__class__)
             
             return instance
-            
+
         except StorageError as e:
+            logger.error(f"Storage error while loading model: {e}")
             raise IOError(f"Failed to load model from {path}: {str(e)}")
         except ValueError as e:
             # Re-raise ValueError without wrapping
+            logger.error(f"Validation error while loading model: {e}")
             raise e
         except Exception as e:
+            logger.error(f"Unexpected error while loading model: {e}")
             raise IOError(f"Unexpected error loading model from {path}: {str(e)}")
+        finally:
+            # Clean up temporary directory if it exists
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                    logger.debug(f"Cleaned up temporary directory: {temp_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e}")
     
 class SparkTabNetModelWriter(MLWriter):
     """Custom MLWriter for SparkTabNetModel.
@@ -644,7 +789,7 @@ class SparkTabNetModelWriter(MLWriter):
                     'output_dim': tabnet.output_dim,
                     '_task': 'classification'
                 },
-                'network_state': tabnet.network.state_dict(),
+                'network_state': tabnet.network.state_dict() if hasattr(tabnet, 'network') else {},
                 '_mlflow_model_info': {
                     'model_type': 'SparkTabNetModel',
                     'tabnet_state': {
@@ -657,7 +802,7 @@ class SparkTabNetModelWriter(MLWriter):
                         'input_dim': tabnet.input_dim,
                         'output_dim': tabnet.output_dim,
                         'classes_': tabnet.classes_,
-                        'state_dict': tabnet.network.state_dict()
+                        'state_dict': tabnet.network.state_dict() if hasattr(tabnet, 'network') else {}
                     }
                 }
             }
@@ -712,16 +857,32 @@ class SparkTabNetModelWriter(MLWriter):
             spark = SparkSession.builder.getOrCreate()
             sc = spark.sparkContext
             
-            # Save metadata with proper parameter handling
-            writer = DefaultParamsWriter(self.instance)
-            
-            # Delete existing metadata directory if it exists
+            # Create metadata with proper parameter handling
             metadata_path = os.path.join(path, "metadata")
-            if os.path.exists(metadata_path):
-                import shutil
-                shutil.rmtree(metadata_path)
-                
-            writer.saveMetadata(self.instance, path, sc)
+            os.makedirs(metadata_path, exist_ok=True)
+            
+            # Create metadata content
+            metadata = {
+                "class": f"{self.instance.__module__}.{self.instance.__class__.__name__}",
+                "timestamp": int(time.time() * 1000),
+                "sparkVersion": sc.version,
+                "uid": self.instance.uid,
+                "paramMap": {
+                    param.name: param_values[param]
+                    for param in self.instance.params
+                    if param in param_values and param != self.instance.tabnet_model
+                },
+                "defaultParamMap": {
+                    param.name: self.instance._defaultParamMap[param]
+                    for param in self.instance.params
+                    if param in self.instance._defaultParamMap and param != self.instance.tabnet_model
+                }
+            }
+            
+            # Write metadata directly to avoid Hadoop filesystem issues
+            with open(os.path.join(metadata_path, "part-00000"), "w") as f:
+                import json
+                json.dump(metadata, f)
             
             # Restore parameters
             for param, value in param_values.items():
@@ -771,7 +932,8 @@ class SparkTabNetModelReader(MLReader):
                             tabnet.output_dim = state['output_dim']
                             tabnet._initialize_network()
                             tabnet.classes_ = state['classes_']
-                            tabnet.network.load_state_dict(state['state_dict'])
+                            if 'state_dict' in state and state['state_dict']:
+                                tabnet.network.load_state_dict(state['state_dict'])
                             stage.tabnet = tabnet
                             stage._paramMap[stage.tabnet_model] = tabnet
                             stage._defaultParamMap[stage.tabnet_model] = tabnet
@@ -799,7 +961,8 @@ class SparkTabNetModelReader(MLReader):
                             tabnet.output_dim = state['output_dim']
                             tabnet._set_network()
                             tabnet.classes_ = state['classes_']
-                            tabnet.network.load_state_dict(state['state_dict'])
+                            if 'state_dict' in state and state['state_dict']:
+                                tabnet.network.load_state_dict(state['state_dict'])
                             last_stage.tabnet = tabnet
                             last_stage._paramMap[last_stage.tabnet_model] = tabnet
                             last_stage._defaultParamMap[last_stage.tabnet_model] = tabnet
@@ -825,7 +988,8 @@ class SparkTabNetModelReader(MLReader):
                     tabnet.output_dim = state['output_dim']
                     tabnet._initialize_network()
                     tabnet.classes_ = state['classes_']
-                    tabnet.network.load_state_dict(state['state_dict'])
+                    if 'state_dict' in state and state['state_dict']:
+                        tabnet.network.load_state_dict(state['state_dict'])
                     model.tabnet = tabnet
                     model._paramMap[model.tabnet_model] = tabnet
                     model._defaultParamMap[model.tabnet_model] = tabnet
