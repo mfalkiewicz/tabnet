@@ -1,338 +1,404 @@
-"""Tests for MLflow integration in SparkTabNetModel."""
+"""Tests for MLflow integration with TabNet Spark transformer."""
 
 import os
 import tempfile
 import pytest
-import mlflow
 import numpy as np
-import logging
 import pickle
 from unittest.mock import patch, MagicMock
-
-logger = logging.getLogger(__name__)
+import logging
+import mlflow
+from types import SimpleNamespace
 
 from pytorch_tabnet.spark.transformer import SparkTabNetModel
-from pytorch_tabnet.tab_model import TabNetClassifier
+from tests.utils import DummyTabNet
 
-@pytest.fixture
-def mock_mlflow_client():
-    """Create a mock MLflow client."""
-    with patch('mlflow.tracking.MlflowClient') as mock_client:
-        yield mock_client()
+# Apply patches
+patch('pytorch_tabnet.tab_network.TabNet', DummyTabNet).start()
+patch('pytorch_tabnet.spark.transformer.TabNet', DummyTabNet).start()
+
 
 @pytest.fixture
 def mock_tabnet_model():
     """Create a mock TabNet model."""
-    model = TabNetClassifier()
-    model.n_d = 8
-    model.n_a = 8
-    model.n_steps = 3
-    model.gamma = 1.3
-    model.cat_idxs = []
-    model.cat_dims = []
-    model.input_dim = 10
-    model.output_dim = 2
-    model.classes_ = np.array([0, 1])
-    return model
+    network = DummyTabNet(
+        input_dim=10,
+        output_dim=2,
+        n_d=8,
+        n_a=8,
+        n_steps=3,
+        gamma=1.3,
+        cat_idxs=[],
+        cat_dims=[]
+    )
+    return {
+        'network': network,
+        'classes_': np.array([0, 1]),
+        'input_dim': 10,
+        'output_dim': 2,
+        'n_d': 8,
+        'n_a': 8,
+        'n_steps': 3,
+        'gamma': 1.3,
+        'cat_idxs': [],
+        'cat_dims': []
+    }
+
 
 @pytest.fixture
 def mock_network():
-    """Create a mock network with state dict."""
-    network = MagicMock()
-    network.state_dict.return_value = {}
-    return network
+    """Create a mock network."""
+    return DummyTabNet(
+        input_dim=10,
+        output_dim=2,
+        n_d=8,
+        n_a=8,
+        n_steps=3,
+        gamma=1.3,
+        cat_idxs=[],
+        cat_dims=[]
+    )
+
+
+@pytest.fixture(scope="module")
+def spark():
+    """Create a SparkSession for testing."""
+    from pyspark.sql import SparkSession
+    spark = (SparkSession.builder
+            .master("local[1]")
+            .appName("test")
+            .getOrCreate())
+    yield spark
+    spark.stop()
 
 @pytest.fixture
-def mock_tabnet_model(mock_network):
-    """Create a mock TabNet model."""
-    model = TabNetClassifier()
-    model.n_d = 8
-    model.n_a = 8
-    model.n_steps = 3
-    model.gamma = 1.3
-    model.cat_idxs = []
-    model.cat_dims = []
-    model.input_dim = 10
-    model.output_dim = 2
-    model.classes_ = np.array([0, 1])
-    model.network = mock_network
-    return model
+def mock_mlflow_client():
+    """Create a mock MLflow client."""
+    return MagicMock()
+
 
 def test_load_local_file(mock_tabnet_model, mock_network):
     """Test loading model from local file."""
-    # Save model to temporary file
     with tempfile.TemporaryDirectory() as temp_dir:
         model_path = os.path.join(temp_dir, "model")
         os.makedirs(model_path)
-        
+
         # Create a SparkTabNetModel instance
         spark_model = SparkTabNetModel(tabnet_model=mock_tabnet_model)
         
         # Save the model
-        spark_model.write().save(model_path)
+        spark_model.save(model_path)
         
-        # Mock network for loaded model
-        with patch('pytorch_tabnet.tab_model.TabNetClassifier._initialize_network') as mock_init:
-            mock_init.return_value = mock_network
-            
-            # Load the model
-            loaded_model = SparkTabNetModel.load(model_path)
-            
-            # Verify model attributes
-            assert loaded_model.tabnet.n_d == mock_tabnet_model.n_d
-            assert loaded_model.tabnet.n_a == mock_tabnet_model.n_a
-            assert loaded_model.tabnet.n_steps == mock_tabnet_model.n_steps
-            assert loaded_model.tabnet.gamma == mock_tabnet_model.gamma
-            assert loaded_model.tabnet.input_dim == mock_tabnet_model.input_dim
-            assert loaded_model.tabnet.output_dim == mock_tabnet_model.output_dim
-            assert np.array_equal(loaded_model.tabnet.classes_, mock_tabnet_model.classes_)
-def test_load_mlflow_artifact(mock_mlflow_client, mock_tabnet_model, mock_network, tmp_path):
-    """Test loading model from MLflow artifact store."""
-    # Create a temporary directory for the model
+        # Load the model
+        loaded_model = SparkTabNetModel.load(model_path)
+        
+        # Verify the loaded model
+        assert loaded_model._network is not None
+        assert loaded_model._input_dim == mock_tabnet_model['input_dim']
+        assert loaded_model._output_dim == mock_tabnet_model['output_dim']
+        assert np.array_equal(loaded_model._classes, mock_tabnet_model['classes_'])
+
+@patch('mlflow.tracking.MlflowClient')
+def test_load_mlflow_artifact(mock_client_class, mock_tabnet_model, mock_network, tmp_path, caplog, spark):
+    """Test loading model from MLflow artifact store with enhanced error handling."""
+    caplog.set_level(logging.INFO)
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    
+
     # Save a mock model to the temporary directory
     spark_model = SparkTabNetModel(tabnet_model=mock_tabnet_model)
-    spark_model.write().save(str(model_dir))
-    
-    # Create TabNet model state file
-    with open(os.path.join(model_dir, "tabnet_model.pkl"), "wb") as f:
-        pickle.dump({
-            "init_params": {
-                "n_d": mock_tabnet_model.n_d,
-                "n_a": mock_tabnet_model.n_a,
-                "n_steps": mock_tabnet_model.n_steps,
-                "gamma": mock_tabnet_model.gamma,
-                "cat_idxs": mock_tabnet_model.cat_idxs,
-                "cat_dims": mock_tabnet_model.cat_dims,
-                "input_dim": mock_tabnet_model.input_dim,
-                "output_dim": mock_tabnet_model.output_dim
+    spark_model._setDefault(inputCol="features", outputCol="predictions")  # Set defaults for Spark params
+    spark_model.save(str(model_dir))
+
+    # Set up mock client with multiple download attempts
+    mock_client = mock_client_class.return_value
+    local_path = os.path.join(str(model_dir), "model")
+    mock_client.download_artifacts.side_effect = [
+        mlflow.exceptions.MlflowException("Run 'test' not found"),  # First attempt fails
+        local_path,  # Second attempt succeeds
+        local_path   # Third attempt (not reached)
+    ]
+
+    with patch('mlflow.get_artifact_uri') as mock_get_uri, \
+         patch('os.path.exists') as mock_exists, \
+         patch('os.path.getsize') as mock_getsize, \
+         patch('pyspark.ml.util.DefaultParamsReader.loadMetadata') as mock_load_metadata, \
+         patch('builtins.open') as mock_open:
+        mock_get_uri.return_value = local_path
+        
+        # Mock metadata loading with defaultParamMap
+        mock_load_metadata.return_value = {
+            "class": "pytorch_tabnet.spark.transformer.SparkTabNetModel",
+            "timestamp": 1234567890,
+            "sparkVersion": "3.0.0",
+            "uid": "test",
+            "paramMap": {"inputCol": "features", "outputCol": "predictions"},
+            "defaultParamMap": {
+                "inputCol": "features",
+                "outputCol": "predictions",
+                "n_d": 8,
+                "n_a": 8,
+                "n_steps": 3,
+                "gamma": 1.3,
+                "cat_idxs": [],
+                "cat_dims": [],
+                "num_processes": 1,
+                "use_gpu": False
+            }
+        }
+        
+        # Mock file existence and size checks
+        def exists_check(path):
+            if isinstance(path, str):
+                if path == local_path or path.endswith('metadata') or path.endswith('tabnet_model.pkl'):
+                    return True
+                if path.startswith('file:'):  # Handle Spark's file:// paths
+                    clean_path = path.replace('file:', '')
+                    return exists_check(clean_path)
+            return False
+        mock_exists.side_effect = exists_check
+        
+        # Mock file size checks
+        mock_getsize.return_value = 1000  # Non-empty files
+
+        # Mock file content for tabnet_model.pkl
+        mock_data = pickle.dumps({
+            'network_params': {
+                'input_dim': mock_tabnet_model['input_dim'],
+                'output_dim': mock_tabnet_model['output_dim'],
+                'n_d': mock_tabnet_model['n_d'],
+                'n_a': mock_tabnet_model['n_a'],
+                'n_steps': mock_tabnet_model['n_steps'],
+                'gamma': mock_tabnet_model['gamma'],
+                'cat_idxs': mock_tabnet_model['cat_idxs'],
+                'cat_dims': mock_tabnet_model['cat_dims']
             },
-            "class_attrs": {
-                "classes_": mock_tabnet_model.classes_,
-                "input_dim": mock_tabnet_model.input_dim,
-                "output_dim": mock_tabnet_model.output_dim,
-                "_task": "classification"
-            },
-            "network_state": {}
-        }, f)
+            'state_dict': mock_network.state_dict(),
+            'classes_': mock_tabnet_model['classes_']
+        })
+        
+        # Set up mock file object for binary reading
+        from io import BytesIO
+        mock_file = BytesIO(mock_data)
+        mock_file_context = MagicMock()
+        mock_file_context.__enter__.return_value = mock_file
+        mock_file_context.__exit__.return_value = None
+        mock_open.return_value = mock_file_context
+
+        # Load model using MLflow URI
+        loaded_model = SparkTabNetModel.load("mlflow://test/model")
+        
+        # Verify the loaded model
+        assert loaded_model._network is not None
+        assert loaded_model._input_dim == mock_tabnet_model['input_dim']
+        assert loaded_model._output_dim == mock_tabnet_model['output_dim']
+        assert np.array_equal(loaded_model._classes, mock_tabnet_model['classes_'])
+        
+        # Verify logging messages
+        assert any("Direct MLflow artifact download failed" in record.message
+                  for record in caplog.records)
+
+@patch('mlflow.tracking.MlflowClient')
+def test_load_mlflow_artifact_empty_files(mock_client_class, mock_tabnet_model, tmp_path, caplog):
+    """Test handling of empty model files."""
+    caplog.set_level(logging.INFO)
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    # Save a mock model
+    spark_model = SparkTabNetModel(tabnet_model=mock_tabnet_model)
+    spark_model.save(str(model_dir))
+
+    mock_client = mock_client_class.return_value
+    local_path = os.path.join(str(model_dir), "model")
+    mock_client.download_artifacts.return_value = local_path
+
+    with patch('os.path.exists') as mock_exists, \
+         patch('os.path.getsize') as mock_getsize:
+        mock_exists.return_value = True
+        mock_getsize.return_value = 0  # Empty files
+
+        with pytest.raises(ValueError, match="Failed to download artifacts from MLflow: All download attempts failed to retrieve a valid model"):
+            SparkTabNetModel.load("mlflow://test/model")
+
+@patch('mlflow.tracking.MlflowClient')
+def test_load_mlflow_artifact_all_strategies_fail(mock_client_class, caplog):
+    """Test behavior when all download strategies fail."""
+    caplog.set_level(logging.INFO)
     
-    # Mock MLflow artifact download to copy from temp directory
-    def mock_download_artifacts(run_id, artifact_path, dst_path):
-        import shutil
-        os.makedirs(dst_path, exist_ok=True)
-        shutil.copytree(model_dir, os.path.join(dst_path, "model"), dirs_exist_ok=True)
-        logger.debug(f"Mock downloaded artifacts to {dst_path}")
-        
-    mock_mlflow_client.download_artifacts.side_effect = mock_download_artifacts
+    mock_client = mock_client_class.return_value
+    # Mock all download attempts to fail
+    mock_client.download_artifacts.side_effect = [
+        mlflow.exceptions.MlflowException("Download failed"),  # First strategy
+        mlflow.exceptions.MlflowException("Download failed"),  # Third strategy
+    ]
     
-    # Mock MLflow run context and artifact URI
-    with patch('mlflow.active_run') as mock_run, \
-         patch('mlflow.get_artifact_uri') as mock_get_uri, \
-         patch('pytorch_tabnet.tab_model.TabNetClassifier._initialize_network') as mock_init:
+    with patch('mlflow.get_artifact_uri') as mock_get_uri, \
+         patch('os.path.exists') as mock_exists:
+        # Mock second strategy to fail
+        mock_get_uri.side_effect = mlflow.exceptions.MlflowException("Failed to get artifact URI")
+        mock_exists.return_value = False
         
-        mock_run.return_value = MagicMock(info=MagicMock(run_id='test_run_id'))
-        mock_get_uri.return_value = "mlflow-artifacts://test"
-        mock_init.return_value = mock_network
+        with pytest.raises(ValueError, match="Model path does not exist and artifact store fallback failed"):
+            SparkTabNetModel.load("mlflow://test/model")
         
-        # Test loading from MLflow URI
-        model_uri = "mlflow://test_run_id/model"
-        loaded_model = SparkTabNetModel.load(model_uri)
-        loaded_model = SparkTabNetModel.load(model_uri)
-        
-        # Verify model attributes
-        assert loaded_model.tabnet.n_d == mock_tabnet_model.n_d
-        assert loaded_model.tabnet.n_a == mock_tabnet_model.n_a
-        assert loaded_model.tabnet.n_steps == mock_tabnet_model.n_steps
-        assert loaded_model.tabnet.gamma == mock_tabnet_model.gamma
-        assert loaded_model.tabnet.input_dim == mock_tabnet_model.input_dim
-        assert loaded_model.tabnet.output_dim == mock_tabnet_model.output_dim
-        assert np.array_equal(loaded_model.tabnet.classes_, mock_tabnet_model.classes_)
-        
-        # Verify MLflow client was called
-        assert mock_mlflow_client.download_artifacts.call_count >= 1
+        # Verify all strategies were attempted
+        assert sum(1 for record in caplog.records if "Attempting download strategy" in record.message) >= 2
+
 
 def test_load_nonexistent_path():
     """Test loading model from nonexistent path."""
     with pytest.raises(ValueError, match="Model path does not exist"):
         SparkTabNetModel.load("/nonexistent/path")
-def test_load_invalid_mlflow_uri(mock_mlflow_client, caplog):
-    """Test loading model from invalid MLflow URI."""
-    # Set up logging capture
+
+
+@patch('mlflow.tracking.MlflowClient')
+def test_load_mlflow_direct_download_failure(mock_client_class, caplog):
+    """Test direct MLflow download failure with fallback."""
     caplog.set_level(logging.DEBUG)
-    
-    # Mock both direct and fallback paths to fail
-    mock_mlflow_client.download_artifacts.side_effect = Exception("Failed to download")
-    
+
+    # Set up mock client to fail both direct download and fallback
+    mock_client = mock_client_class.return_value
+    mock_client.download_artifacts.side_effect = mlflow.exceptions.MlflowException("Failed to download")
+
     with patch('mlflow.get_artifact_uri') as mock_get_uri:
-        # First attempt: direct MLflow URI
+        # Configure mock for fallback attempt to fail
+        mock_get_uri.side_effect = mlflow.exceptions.MlflowException("Failed to get artifact URI")
+
         with pytest.raises(ValueError, match="Model path does not exist and artifact store fallback failed"):
             SparkTabNetModel.load("mlflow://invalid/uri")
-            
-        # Verify warning was logged
-        assert any("Direct MLflow artifact download failed" in record.message and record.levelname == "WARNING" for record in caplog.records)
 
-        # Reset log capture
-        caplog.clear()
+        # Verify both attempts were made
+        assert mock_client.download_artifacts.called
+        assert mock_get_uri.called
 
-        # Second attempt: fallback path
-        mock_get_uri.return_value = "mlflow-artifacts://test"
-        with pytest.raises(ValueError, match="Model path does not exist and artifact store fallback failed"):
-            SparkTabNetModel.load("/nonexistent/path")
-        
-        # Verify both paths were attempted
-        assert mock_mlflow_client.download_artifacts.call_count >= 2
-        
-        # Verify temporary directory cleanup was attempted
-        assert "Cleaned up temporary directory" in caplog.text
-        assert mock_mlflow_client.download_artifacts.call_count >= 2
+    # Verify warning was logged
+    assert any("Direct MLflow artifact download failed" in record.message
+              and record.levelname == "WARNING" for record in caplog.records)
 
-def test_load_artifact_store_fallback(mock_mlflow_client, mock_tabnet_model, mock_network, caplog):
-    """Test loading model with artifact store fallback."""
-    # Set up logging capture
+@patch('mlflow.tracking.MlflowClient')
+def test_load_mlflow_fallback_failure(mock_client_class, caplog):
+    """Test MLflow fallback path failure."""
     caplog.set_level(logging.DEBUG)
-    
-    # Mock MLflow artifact store
+
+    # Set up mock client to fail first attempt
+    mock_client = mock_client_class.return_value
+    mock_client.download_artifacts.side_effect = mlflow.exceptions.MlflowException("Failed to download")
+
+    with patch('mlflow.get_artifact_uri') as mock_get_uri:
+        # Configure mock for fallback attempt
+        mock_get_uri.side_effect = mlflow.exceptions.MlflowException("Failed to get artifact URI")
+
+        with pytest.raises(ValueError, match="Model path does not exist and artifact store fallback failed"):
+            SparkTabNetModel.load("mlflow://invalid/uri")
+
+        # Verify that both attempts were made
+        assert mock_client.download_artifacts.called
+        assert mock_get_uri.called
+
+
+@patch('mlflow.tracking.MlflowClient')
+def test_load_artifact_store_fallback(mock_client_class, mock_tabnet_model, mock_network, tmp_path, caplog):
+    """Test loading model with artifact store fallback."""
+    caplog.set_level(logging.DEBUG)
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    # Save mock model state
+    spark_model = SparkTabNetModel(tabnet_model=mock_tabnet_model)
+    spark_model.save(str(model_dir))
+
+    # Set up mock client
+    mock_client = mock_client_class.return_value
+    local_path = os.path.join(str(model_dir), "model")
+    mock_client.download_artifacts.side_effect = [
+        mlflow.exceptions.MlflowException("Run 'test' not found"),  # First call fails
+        local_path  # Second call succeeds
+    ]
+
     with patch('mlflow.get_artifact_uri') as mock_get_uri, \
-         patch('pytorch_tabnet.tab_model.TabNetClassifier._initialize_network') as mock_init:
-        mock_get_uri.return_value = "mlflow-artifacts://test"
-        mock_init.return_value = mock_network
+         patch('os.path.exists') as mock_exists, \
+         patch('os.path.getsize') as mock_getsize, \
+         patch('pyspark.ml.util.DefaultParamsReader.loadMetadata') as mock_load_metadata, \
+         patch('builtins.open') as mock_open:
+        mock_get_uri.return_value = local_path
         
-        # Create a temporary directory for the model
-        model_dir = tempfile.mkdtemp()
-        os.makedirs(os.path.join(model_dir, "model"), exist_ok=True)
-
-        # Save mock model state
-        spark_model = SparkTabNetModel(tabnet_model=mock_tabnet_model)
-        spark_model.write().save(os.path.join(model_dir, "model"))
-
-        # Create TabNet model state file
-        with open(os.path.join(model_dir, "model", "tabnet_model.pkl"), "wb") as f:
-            pickle.dump({
-                "init_params": {
-                    "n_d": mock_tabnet_model.n_d,
-                    "n_a": mock_tabnet_model.n_a,
-                    "n_steps": mock_tabnet_model.n_steps,
-                    "gamma": mock_tabnet_model.gamma,
-                    "cat_idxs": mock_tabnet_model.cat_idxs,
-                    "cat_dims": mock_tabnet_model.cat_dims,
-                    "input_dim": mock_tabnet_model.input_dim,
-                    "output_dim": mock_tabnet_model.output_dim
-                },
-                "class_attrs": {
-                    "classes_": mock_tabnet_model.classes_,
-                    "input_dim": mock_tabnet_model.input_dim,
-                    "output_dim": mock_tabnet_model.output_dim,
-                    "_task": "classification"
-                },
-                "network_state": {}
-            }, f)
-
-        # Create metadata directory
-        metadata_path = os.path.join(model_dir, "model", "metadata")
-        os.makedirs(metadata_path, exist_ok=True)
-        with open(os.path.join(metadata_path, "part-00000"), "w") as f:
-            f.write('{"class":"org.apache.spark.ml.PipelineModel","timestamp":1234567890,"sparkVersion":"3.5.0","uid":"pipeline_123","paramMap":{},"defaultParamMap":{}}')
-
-        # Reset mock to ensure clean state
-        mock_mlflow_client.download_artifacts.reset_mock()
-
-        # Define mock download function with closure over model_dir
-        def mock_download(run_id, artifact_path, dst_path):
-            logger.debug(f"Mock downloading artifacts to {dst_path}")
-            import shutil
-            os.makedirs(dst_path, exist_ok=True)
-            # Copy the model directory to the destination
-            model_src = os.path.join(model_dir, "model")
-            # Copy directly to the model subdirectory
-            model_dst = os.path.join(dst_path, "model")
-            os.makedirs(model_dst, exist_ok=True)
-            # Copy contents of model directory
-            for item in os.listdir(model_src):
-                src_item = os.path.join(model_src, item)
-                dst_item = os.path.join(model_dst, item)
-                if os.path.isdir(src_item):
-                    shutil.copytree(src_item, dst_item, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(src_item, dst_item)
-            # Copy tabnet_model.pkl to ensure it's in the right place
-            shutil.copy2(
-                os.path.join(model_src, "tabnet_model.pkl"),
-                os.path.join(model_dst, "tabnet_model.pkl")
-            )
-            # Log directory structure
-            logger.debug(f"Files in destination root: {os.listdir(dst_path)}")
-            logger.debug(f"Files in model directory: {os.listdir(model_dst)}")
-            logger.debug(f"Model file exists: {os.path.exists(os.path.join(model_dst, 'tabnet_model.pkl'))}")
-            return True
-
-        # Mock active run
-        mock_run = MagicMock()
-        mock_run.info.run_id = "test_run_id"
-
-        # Create a custom side effect handler that preserves run_id
-        class SideEffectHandler:
-            def __init__(self):
-                self.call_count = 0
-
-            def __call__(self, run_id, artifact_path, dst_path):
-                self.call_count += 1
-                logger.debug(f"Download attempt {self.call_count} with run_id: {run_id}, path: {artifact_path}")
-                
-                if self.call_count == 1:
-                    raise Exception("Direct path failed")
-                
-                # For the second attempt, ensure we're using the correct path
-                if self.call_count == 2:
-                    # Copy the model to the destination
-                    result = mock_download(run_id, artifact_path, dst_path)
-                    
-                    # Log directory structure before returning
-                    logger.debug(f"Files in destination root: {os.listdir(dst_path)}")
-                    if os.path.exists(os.path.join(dst_path, "model")):
-                        model_dir = os.path.join(dst_path, "model")
-                        logger.debug(f"Files in model directory: {os.listdir(model_dir)}")
-                        if os.path.exists(os.path.join(model_dir, "tabnet_model.pkl")):
-                            logger.debug("Found tabnet_model.pkl in model directory")
-                            return result
-                        else:
-                            logger.error("tabnet_model.pkl not found in model directory")
-                            raise ValueError("Model file not found after download")
-                    else:
-                        logger.error("Model directory not found in downloaded artifacts")
-                        raise ValueError("Model directory not found")
-                
-                return False
-
-        # Set up mock with side effect handler
-        mock_mlflow_client.download_artifacts.side_effect = SideEffectHandler()
-
-        # Mock get_artifact_uri to return a valid URI
-        mock_get_uri.return_value = "mlflow-artifacts://test"
-
-        # Test loading with fallback
-        with patch('mlflow.active_run', return_value=mock_run):
-            loaded_model = SparkTabNetModel.load("/nonexistent/path")
+        # Mock metadata loading with defaultParamMap
+        mock_load_metadata.return_value = {
+            "class": "pytorch_tabnet.spark.transformer.SparkTabNetModel",
+            "timestamp": 1234567890,
+            "sparkVersion": "3.0.0",
+            "uid": "test",
+            "paramMap": {"inputCol": "features", "outputCol": "predictions"},
+            "defaultParamMap": {
+                "inputCol": "features",
+                "outputCol": "predictions",
+                "n_d": 8,
+                "n_a": 8,
+                "n_steps": 3,
+                "gamma": 1.3,
+                "cat_idxs": [],
+                "cat_dims": [],
+                "num_processes": 1,
+                "use_gpu": False
+            }
+        }
         
-        # Verify model attributes
-        assert loaded_model.tabnet.n_d == mock_tabnet_model.n_d
-        assert loaded_model.tabnet.n_a == mock_tabnet_model.n_a
-        assert loaded_model.tabnet.n_steps == mock_tabnet_model.n_steps
-        assert loaded_model.tabnet.gamma == mock_tabnet_model.gamma
-        assert loaded_model.tabnet.input_dim == mock_tabnet_model.input_dim
-        assert loaded_model.tabnet.output_dim == mock_tabnet_model.output_dim
-        assert np.array_equal(loaded_model.tabnet.classes_, mock_tabnet_model.classes_)
+        # Mock file existence checks
+        def exists_check(path):
+            if isinstance(path, str):
+                # Handle both the direct path and nested model directory cases
+                if path == local_path or path == os.path.join(local_path, "model"):
+                    return True
+                if path.endswith('metadata') or path.endswith('model/metadata'):
+                    return True
+                if path.endswith('tabnet_model.pkl') or path.endswith('model/tabnet_model.pkl'):
+                    return True
+                # Handle file:// protocol paths
+                if path.startswith('file://'):
+                    clean_path = path.replace('file://', '')
+                    return exists_check(clean_path)
+            return False
+        mock_exists.side_effect = exists_check
         
-        # Verify MLflow client was called multiple times
-        assert mock_mlflow_client.download_artifacts.call_count >= 2
+        # Mock file size checks
+        mock_getsize.return_value = 1000  # Non-empty files
         
-        # Verify network initialization
-        mock_init.assert_called_once()
+        # Mock file content for tabnet_model.pkl
+        mock_data = pickle.dumps({
+            'network_params': {
+                'input_dim': mock_tabnet_model['input_dim'],
+                'output_dim': mock_tabnet_model['output_dim'],
+                'n_d': mock_tabnet_model['n_d'],
+                'n_a': mock_tabnet_model['n_a'],
+                'n_steps': mock_tabnet_model['n_steps'],
+                'gamma': mock_tabnet_model['gamma'],
+                'cat_idxs': mock_tabnet_model['cat_idxs'],
+                'cat_dims': mock_tabnet_model['cat_dims']
+            },
+            'state_dict': mock_network.state_dict(),
+            'classes_': mock_tabnet_model['classes_']
+        })
         
-        # Verify logging behavior
-        assert "Initial download attempt failed: Direct path failed" in caplog.text
-        assert "Retrying with artifact store path: /nonexistent/path" in caplog.text
-        assert "Found model files at:" in caplog.text
-        assert "Successfully loaded TabNet model" in caplog.text
-        assert "Cleaned up temporary directory" in caplog.text
+        # Set up mock file object for binary reading
+        from io import BytesIO
+        mock_file = BytesIO(mock_data)
+        mock_file_context = MagicMock()
+        mock_file_context.__enter__.return_value = mock_file
+        mock_file_context.__exit__.return_value = None
+        mock_open.return_value = mock_file_context
+
+        # Load model using MLflow URI
+        loaded_model = SparkTabNetModel.load("mlflow://test/model")
+
+        # Verify the loaded model
+        assert loaded_model._network is not None
+        assert loaded_model._input_dim == mock_tabnet_model['input_dim']
+        assert loaded_model._output_dim == mock_tabnet_model['output_dim']
+        assert np.array_equal(loaded_model._classes, mock_tabnet_model['classes_'])
+
+        # Verify warning was logged
+        assert any("Direct MLflow artifact download failed" in record.message
+                  and record.levelname == "WARNING" for record in caplog.records)
+

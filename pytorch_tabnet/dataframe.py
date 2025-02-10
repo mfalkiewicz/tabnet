@@ -93,7 +93,9 @@ class SparkDataFrame(TabNetDataFrame):
         return all(col in self._df.columns for col in cols)
     
     def get_shape(self) -> Tuple[int, int]:
-        return self._df.count(), len(self._df.columns)
+        # Convert to pandas to get shape since it's more reliable than count()
+        pdf = self._df.toPandas()
+        return pdf.shape
     
     @property
     def columns(self):
