@@ -516,6 +516,7 @@ class SparkTabNetModel(Model, HasInputCol, HasOutputCol,
             model._output_dim = network_params['output_dim']
             model.labelCols = state.get('labelCols')
 
+            logger.info("Model loaded successfully from MLflow artifact store")
             return model
 
         except ValueError as e:

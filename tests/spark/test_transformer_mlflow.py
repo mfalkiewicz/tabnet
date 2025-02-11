@@ -11,7 +11,7 @@ import mlflow
 from types import SimpleNamespace
 
 from pytorch_tabnet.spark.transformer import SparkTabNetModel
-from tests.utils import DummyTabNet
+from tests.utils import DummyTabNet, create_test_data
 
 # Apply patches
 patch('pytorch_tabnet.tab_network.TabNet', DummyTabNet).start()
@@ -402,3 +402,83 @@ def test_load_artifact_store_fallback(mock_client_class, mock_tabnet_model, mock
         assert any("Direct MLflow artifact download failed" in record.message
                   and record.levelname == "WARNING" for record in caplog.records)
 
+
+@pytest.mark.integration
+def test_end_to_end_mlflow_dfs_integration(spark, tmp_path, caplog):
+    """End-to-end integration test for MLflow model loading with DFS emulation.
+    
+    This test verifies the complete flow of:
+    1. Training a model on synthetic data
+    2. Saving it as an MLflow model
+    3. Loading the model using DFS emulation
+    4. Executing predictions
+    """
+    caplog.set_level(logging.INFO)
+    
+    # Create synthetic test data
+    df = create_test_data(spark, n_samples=100, n_features=10)
+    
+    # Create and configure model
+    model_config = {
+        'input_dim': 10,
+        'output_dim': 2,
+        'n_d': 8,
+        'n_a': 8,
+        'n_steps': 3,
+        'gamma': 1.3,
+        'cat_idxs': [],
+        'cat_dims': []
+    }
+    
+    network = DummyTabNet(**model_config)
+    tabnet_model = {
+        'network': network,
+        'classes_': np.array([0, 1]),
+        **model_config
+    }
+    
+    # Initialize SparkTabNetModel
+    spark_model = SparkTabNetModel(tabnet_model=tabnet_model)
+    spark_model._setDefault(inputCol="features", outputCol="predictions")
+    
+    # Create DFS-like temporary directory structure
+    dfs_root = tmp_path / "dfs"
+    model_path = dfs_root / "models" / "tabnet"
+    os.makedirs(model_path, exist_ok=True)
+    
+    # Configure MLflow tracking
+    mlflow.set_tracking_uri(mlflow.get_tracking_uri())
+    
+    # Save model using MLflow
+    with mlflow.start_run() as run:
+        # Save model to DFS-like path
+        spark_model.save(str(model_path))
+        mlflow.log_artifacts(str(model_path), "model")
+        run_id = run.info.run_id
+        
+        # Log the run ID and artifact path for debugging
+        logging.info(f"MLflow run ID: {run_id}")
+        logging.info(f"MLflow artifact path: {mlflow.get_artifact_uri('model')}")
+    
+    # Load model using MLflow with DFS path
+    mlflow_uri = f"mlflow://{run_id}/model"
+    logging.info(f"Attempting to load model from URI: {mlflow_uri}")
+    loaded_model = SparkTabNetModel.load(mlflow_uri)
+    
+    # Verify model structure
+    assert loaded_model._network is not None
+    assert loaded_model._input_dim == model_config['input_dim']
+    assert loaded_model._output_dim == model_config['output_dim']
+    assert np.array_equal(loaded_model._classes, tabnet_model['classes_'])
+    
+    # Execute predictions
+    predictions = loaded_model.transform(df)
+    assert "predictions" in predictions.columns
+    
+    # Verify predictions shape and values
+    pred_count = predictions.select("predictions").count()
+    assert pred_count == 100  # Matches input sample count
+    
+    # Log successful test completion
+    assert any("Model loaded successfully from MLflow artifact store" in record.message
+              for record in caplog.records)
