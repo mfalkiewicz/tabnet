@@ -30,7 +30,7 @@ class DummyTabNet(torch.nn.Module):
         mask_type="sparsemax",
         group_attention_matrix=None,
     ):
-        super(DummyTabNet, self).__init__()
+        torch.nn.Module.__init__(self)
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.n_d = n_d
@@ -50,7 +50,8 @@ class DummyTabNet(torch.nn.Module):
         # Create minimal learnable parameters for state_dict
         self.dummy_param = torch.nn.Parameter(torch.randn(1))
         self.embedder = DummyEmbedder(input_dim, cat_dims, cat_idxs, cat_emb_dim)
-        self.feature_transformer = DummyFeatureTransformer(input_dim, output_dim)
+        self.post_embed_dim = self.embedder.post_embed_dim
+        self.feature_transformer = DummyFeatureTransformer(self.post_embed_dim, output_dim)
         
     def forward(self, x):
         """Simplified forward pass returning dummy predictions."""
@@ -105,34 +106,85 @@ class DummyTabNet(torch.nn.Module):
 class DummyEmbedder(Module):
     """Minimal embedder implementation for testing."""
     def __init__(self, input_dim, cat_dims, cat_idxs, cat_emb_dim):
-        super().__init__()
+        torch.nn.Module.__init__(self)
         self.input_dim = input_dim
-        self.post_embed_dim = input_dim  # Simplified
-        self.embedding_group_matrix = torch.eye(input_dim)  # Identity matrix
-        self.dummy_embed = torch.nn.Parameter(torch.randn(1))
+        self.cat_dims = cat_dims or []
+        self.cat_idxs = cat_idxs or []
+        
+        # Handle cat_emb_dim properly like real TabNet
+        if isinstance(cat_emb_dim, int):
+            self.cat_emb_dims = [cat_emb_dim] * len(self.cat_dims)
+        else:
+            self.cat_emb_dims = cat_emb_dim
+            
+        # Calculate post_embed_dim exactly like real TabNet
+        if self.cat_dims and self.cat_idxs:
+            self.post_embed_dim = int(input_dim + np.sum(self.cat_emb_dims) - len(self.cat_idxs))
+        else:
+            self.post_embed_dim = input_dim
+            
+        # Create embeddings for categorical features
+        self.embeddings = torch.nn.ModuleList()
+        if self.cat_dims:
+            for cat_dim, emb_dim in zip(self.cat_dims, self.cat_emb_dims):
+                self.embeddings.append(torch.nn.Embedding(cat_dim, emb_dim))
+                
+        self.embedding_group_matrix = torch.eye(self.post_embed_dim)
         
     def forward(self, x):
-        """Pass through without embedding."""
-        return x
+        """Process input with proper categorical embedding."""
+        if not self.cat_dims:
+            return x
+            
+        # Split categorical and continuous features
+        cat_features = []
+        cont_features = []
+        
+        for i in range(self.input_dim):
+            if i in self.cat_idxs:
+                cat_idx = self.cat_idxs.index(i)
+                cat_dim = self.cat_dims[cat_idx]
+                cat_emb = self.embeddings[cat_idx]
+                cat_col = x[:, i].long()
+                embedded_col = cat_emb(cat_col)
+                cat_features.append(embedded_col)
+            else:
+                cont_features.append(x[:, i].unsqueeze(1))
+                
+        # Combine features
+        if cont_features:
+            cont_features = torch.cat(cont_features, dim=1)
+        else:
+            cont_features = torch.empty((x.shape[0], 0), device=x.device)
+            
+        if cat_features:
+            cat_features = torch.cat(cat_features, dim=1)
+            return torch.cat([cont_features, cat_features], dim=1)
+        else:
+            return cont_features
 
 
 class DummyFeatureTransformer(Module):
     """Feature transformer that mimics TabNet's feature processing."""
     def __init__(self, input_dim, output_dim):
-        super().__init__()
-        # Shared feature processing layers
+        torch.nn.Module.__init__(self)
+        # Match real TabNet's feature processing
+        self.input_dim = input_dim
+        self.output_dim = output_dim
         self.shared = torch.nn.ModuleList([
             torch.nn.Linear(input_dim, input_dim),
             torch.nn.BatchNorm1d(input_dim)
         ])
-        # Feature normalization
+        # Feature normalization matching TabNet's behavior
         self.feature_bn = torch.nn.BatchNorm1d(input_dim)
-        # Attention mechanism
+        # Attention mechanism with proper dimensions
         self.attention = torch.nn.Linear(input_dim, input_dim)
-        # Output transformation
+        # Output transformation with correct dimensions
         self.output = torch.nn.Linear(input_dim, output_dim)
         # Learnable scale parameter
         self.scale = torch.nn.Parameter(torch.ones(1))
+        # Add post_embed_dim to match real TabNet
+        self.post_embed_dim = input_dim
         
     def forward(self, x):
         """More realistic feature transformation with attention."""

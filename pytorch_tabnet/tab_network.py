@@ -88,7 +88,7 @@ class TabNetEncoder(torch.nn.Module):
         group_attention_matrix : torch matrix
             Matrix of size (n_groups, input_dim), m_ij = importance within group i of feature j
         """
-        super(TabNetEncoder, self).__init__()
+        torch.nn.Module.__init__(self)
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.is_multi_task = isinstance(output_dim, list)
@@ -250,7 +250,7 @@ class TabNetDecoder(torch.nn.Module):
         momentum : float
             Float value between 0 and 1 which will be used for momentum in all batch norm
         """
-        super(TabNetDecoder, self).__init__()
+        torch.nn.Module.__init__(self)
         self.input_dim = input_dim
         self.n_d = n_d
         self.n_steps = n_steps
@@ -445,7 +445,7 @@ class TabNetNoEmbeddings(torch.nn.Module):
         group_attention_matrix : torch matrix
             Matrix of size (n_groups, input_dim), m_ij = importance within group i of feature j
         """
-        super(TabNetNoEmbeddings, self).__init__()
+        torch.nn.Module.__init__(self)
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.is_multi_task = isinstance(output_dim, list)
@@ -566,11 +566,19 @@ class TabNet(torch.nn.Module):
         group_attention_matrix : torch matrix
             Matrix of size (n_groups, input_dim), m_ij = importance within group i of feature j
         """
-        super(TabNet, self).__init__()
+        # Initialize parent class first
+        super().__init__()
+        
+        # Validate inputs
+        if n_steps <= 0:
+            raise ValueError("n_steps should be a positive integer.")
+        if n_independent == 0 and n_shared == 0:
+            raise ValueError("n_shared and n_independent can't be both zero.")
+            
+        # Set attributes
         self.cat_idxs = cat_idxs or []
         self.cat_dims = cat_dims or []
         self.cat_emb_dim = cat_emb_dim
-
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.n_d = n_d
@@ -581,32 +589,30 @@ class TabNet(torch.nn.Module):
         self.n_independent = n_independent
         self.n_shared = n_shared
         self.mask_type = mask_type
-
-        if self.n_steps <= 0:
-            raise ValueError("n_steps should be a positive integer.")
-        if self.n_independent == 0 and self.n_shared == 0:
-            raise ValueError("n_shared and n_independent can't be both zero.")
-
         self.virtual_batch_size = virtual_batch_size
+        self.momentum = momentum
+        
+        # Initialize embedder first since it's needed for post_embed_dim
         self.embedder = EmbeddingGenerator(
             input_dim, cat_dims, cat_idxs, cat_emb_dim, group_attention_matrix
         )
         self.post_embed_dim = self.embedder.post_embed_dim
 
+        # Initialize TabNetNoEmbeddings with proper dimensions and parameters
         self.tabnet = TabNetNoEmbeddings(
-            self.post_embed_dim,
-            output_dim,
-            n_d,
-            n_a,
-            n_steps,
-            gamma,
-            n_independent,
-            n_shared,
-            epsilon,
-            virtual_batch_size,
-            momentum,
-            mask_type,
-            self.embedder.embedding_group_matrix,
+            input_dim=self.post_embed_dim,
+            output_dim=output_dim,
+            n_d=n_d,
+            n_a=n_a,
+            n_steps=n_steps,
+            gamma=gamma,
+            n_independent=n_independent,
+            n_shared=n_shared,
+            epsilon=epsilon,
+            virtual_batch_size=virtual_batch_size,
+            momentum=momentum,
+            mask_type=mask_type,
+            group_attention_matrix=self.embedder.embedding_group_matrix,
         )
 
     def forward(self, x):
@@ -644,7 +650,7 @@ class AttentiveTransformer(torch.nn.Module):
         mask_type : str
             Either "sparsemax" or "entmax" : this is the masking function to use
         """
-        super(AttentiveTransformer, self).__init__()
+        torch.nn.Module.__init__(self)
         self.fc = Linear(input_dim, group_dim, bias=False)
         initialize_non_glu(self.fc, input_dim, group_dim)
         self.bn = GBN(
@@ -752,7 +758,7 @@ class GLU_Block(torch.nn.Module):
         virtual_batch_size=128,
         momentum=0.02,
     ):
-        super(GLU_Block, self).__init__()
+        torch.nn.Module.__init__(self)
         self.first = first
         self.shared_layers = shared_layers
         self.n_glu = n_glu
@@ -784,7 +790,7 @@ class GLU_Layer(torch.nn.Module):
     def __init__(
         self, input_dim, output_dim, fc=None, virtual_batch_size=128, momentum=0.02
     ):
-        super(GLU_Layer, self).__init__()
+        torch.nn.Module.__init__(self)
 
         self.output_dim = output_dim
         if fc:
@@ -827,7 +833,7 @@ class EmbeddingGenerator(torch.nn.Module):
         group_matrix : torch matrix
             Original group matrix before embeddings
         """
-        super(EmbeddingGenerator, self).__init__()
+        torch.nn.Module.__init__(self)
 
         if cat_dims == [] and cat_idxs == []:
             self.skip_embedding = True

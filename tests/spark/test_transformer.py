@@ -8,15 +8,16 @@ from pyspark.sql.types import StructType, StructField, DoubleType, ArrayType
 import os
 from unittest.mock import patch
 
-# Import DummyTabNet before patching
 from tests.utils import DummyTabNet
-
-# Apply patches
-patch('pytorch_tabnet.tab_network.TabNet', DummyTabNet).start()
-patch('pytorch_tabnet.spark.transformer.TabNet', DummyTabNet).start()
-
 from pytorch_tabnet.spark.transformer import SparkTabNetEstimator, SparkTabNetModel
 from pytorch_tabnet.dataframe import SparkDataFrame
+
+@pytest.fixture(scope="function")
+def mock_tabnet(monkeypatch):
+    """Fixture to provide DummyTabNet for testing."""
+    monkeypatch.setattr('pytorch_tabnet.tab_network.TabNet', DummyTabNet)
+    monkeypatch.setattr('pytorch_tabnet.spark.transformer.TabNet', DummyTabNet)
+    return DummyTabNet
 
 @pytest.fixture(scope="module")
 def spark():
@@ -101,7 +102,7 @@ def test_prepare_spark_data(test_data):
     assert prepared_data.validate_columns(["features", "label"])
 
 
-def test_spark_tabnet_model_transform(spark):
+def test_spark_tabnet_model_transform(spark, mock_tabnet):
     """Test model transformation produces correct output schema and values."""
     # Create a minimal test dataset
     n_samples = 5
@@ -147,7 +148,7 @@ def test_spark_tabnet_model_transform(spark):
         assert all(isinstance(x, float) for x in row.predictions)
 
 
-def test_pipeline_integration(test_data):
+def test_pipeline_integration(test_data, mock_tabnet):
     """Test SparkTabNet works correctly in a Spark ML pipeline."""
     pipeline = Pipeline(stages=[
         SparkTabNetEstimator(inputCol="features", outputCol="predictions")
@@ -161,7 +162,7 @@ def test_pipeline_integration(test_data):
     assert predictions.count() == test_data.count()
 
 
-def test_data_type_compatibility(spark):
+def test_data_type_compatibility(spark, mock_tabnet):
     """Test handling of different data types and schemas."""
     np.random.seed(42)  # For reproducibility
     
@@ -206,7 +207,7 @@ def test_data_type_compatibility(spark):
         pytest.fail(f"Failed to process test case: {str(e)}")
 
 
-def test_large_scale_performance(spark):
+def test_large_scale_performance(spark, mock_tabnet):
     """Test performance with large datasets."""
     import pandas as pd
     
@@ -242,7 +243,7 @@ def test_large_scale_performance(spark):
         pytest.fail(f"Failed to process large dataset: {str(e)}")
 
 
-def test_model_persistence(tmp_path, test_data):
+def test_model_persistence(tmp_path, test_data, mock_tabnet):
     """Test model save and load functionality."""
     estimator = SparkTabNetEstimator(inputCol="features", outputCol="predictions")
     model = estimator.fit(test_data)
@@ -349,7 +350,7 @@ def test_model_serialization_edge_cases(spark, tmp_path):
         SparkTabNetModel.load(model_path)
 
 
-def test_mlflow_integration(spark, tmp_path, test_data):
+def test_mlflow_integration(spark, tmp_path, test_data, mock_tabnet):
     """Test MLflow integration for model serialization."""
     import mlflow
     import mlflow.spark
@@ -401,7 +402,7 @@ def test_mlflow_integration(spark, tmp_path, test_data):
             assert loaded_model._tabnet is not None
 
 
-def test_edge_cases(spark, test_data):
+def test_edge_cases(spark, test_data, mock_tabnet):
     """Test handling of edge cases and invalid inputs."""
     empty_df = spark.createDataFrame(
         [], 

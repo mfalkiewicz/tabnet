@@ -64,12 +64,6 @@ class TabNetClassifier(TabModel):
                  mask_type="sparsemax",
                  input_dim=None, output_dim=None,
                  device_name="auto", n_shared_decoder=1, n_indep_decoder=1):
-        # Initialize device first to ensure it's available for network initialization
-        self.device_name = device_name
-        if self.device_name == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(self.device_name)
         super(TabNetClassifier, self).__init__(
             n_d=n_d, n_a=n_a, n_steps=n_steps, gamma=gamma,
             cat_idxs=cat_idxs, cat_dims=cat_dims, cat_emb_dim=cat_emb_dim,
@@ -83,6 +77,12 @@ class TabNetClassifier(TabModel):
             n_shared_decoder=n_shared_decoder,
             n_indep_decoder=n_indep_decoder
         )
+        # Initialize device after parent initialization
+        self.device_name = device_name
+        if self.device_name == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(self.device_name)
         self.class_weights = None
 
     def __post_init__(self):

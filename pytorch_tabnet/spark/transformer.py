@@ -29,6 +29,8 @@ class TabNetParams(Params):
     cat_dims = Param(Params._dummy(), "cat_dims", "List of categorical feature dimensions")
     num_processes = Param(Params._dummy(), "num_processes", "Number of processes for distributed training")
     use_gpu = Param(Params._dummy(), "use_gpu", "Whether to use GPU for training")
+    local_mode = Param(Params._dummy(), "local_mode", "Whether to use local mode for training")
+    seed = Param(Params._dummy(), "seed", "Random seed for reproducibility")
 
     def __init__(self):
         super().__init__()
@@ -40,7 +42,8 @@ class TabNetParams(Params):
             cat_idxs=[],
             cat_dims=[],
             num_processes=1,
-            use_gpu=False
+            use_gpu=False,
+            seed=42
         )
 
     def getNd(self): return self.getOrDefault(self.n_d)
@@ -51,6 +54,8 @@ class TabNetParams(Params):
     def getCatDims(self): return self.getOrDefault(self.cat_dims)
     def getNumProcesses(self): return self.getOrDefault(self.num_processes)
     def getUseGpu(self): return self.getOrDefault(self.use_gpu)
+    def getLocalMode(self): return self.getOrDefault(self.local_mode)
+    def getSeed(self): return self.getOrDefault(self.seed)
 
 class SparkTabNetEstimator(Estimator, HasInputCol, HasOutputCol, HasLabelCol,
                           DefaultParamsReadable, DefaultParamsWritable, TabNetParams):
@@ -58,7 +63,7 @@ class SparkTabNetEstimator(Estimator, HasInputCol, HasOutputCol, HasLabelCol,
 
     def __init__(self, inputCol="features", outputCol="predictions", labelCol="label",
                  n_d=8, n_a=8, n_steps=3, gamma=1.3, cat_idxs=None, cat_dims=None,
-                 num_processes=1, use_gpu=False, labelCols=None):
+                 num_processes=1, use_gpu=False, labelCols=None, local_mode=False, seed=42):
         super().__init__()
         self._setDefault(
             inputCol=inputCol,
@@ -71,8 +76,11 @@ class SparkTabNetEstimator(Estimator, HasInputCol, HasOutputCol, HasLabelCol,
             cat_idxs=cat_idxs if cat_idxs is not None else [],
             cat_dims=cat_dims if cat_dims is not None else [],
             num_processes=num_processes,
-            use_gpu=use_gpu
+            use_gpu=use_gpu,
+            local_mode=local_mode,
+            seed=seed
         )
+        self._setDefault(local_mode=False)
         self.labelCols = labelCols if labelCols is not None else []
 
     def _fit(self, dataset: DataFrame) -> "SparkTabNetModel":
@@ -117,6 +125,10 @@ class SparkTabNetEstimator(Estimator, HasInputCol, HasOutputCol, HasLabelCol,
 
         def train_func():
             """Self-contained training function."""
+            # Set random seed for reproducibility
+            torch.manual_seed(self.getSeed())
+            np.random.seed(self.getSeed())
+            
             # Convert to tensors
             features_tensor = torch.from_numpy(features).float()
             labels_tensor = torch.from_numpy(labels)
@@ -126,9 +138,23 @@ class SparkTabNetEstimator(Estimator, HasInputCol, HasOutputCol, HasLabelCol,
                 output_dim = len(self.labelCols)
             else:
                 unique_labels = np.unique(labels)
-                output_dim = 1 if len(unique_labels) == 2 else len(unique_labels)
+                if len(unique_labels) <= 2:
+                    output_dim = 1  # Binary classification
+                else:
+                    output_dim = len(unique_labels)  # Multiclass classification
+                    self._classes = unique_labels  # Store class labels for later use
+                    self._is_multiclass = True  # Flag for multiclass classification
             
             input_dim = features.shape[1]
+
+            # Configure training based on mode
+            if self.getLocalMode():
+                batch_size = min(1024, len(features))  # Smaller batch size for local mode
+                num_epochs = 20  # Fewer epochs for local mode
+                logger.info("Using local mode for training")
+            else:
+                batch_size = 1024
+                num_epochs = 50
             
             # Initialize network
             network = TabNet(
@@ -158,10 +184,15 @@ class SparkTabNetEstimator(Estimator, HasInputCol, HasOutputCol, HasLabelCol,
             
             # Create data loader
             dataset = TensorDataset(features_tensor, labels_tensor)
-            loader = DataLoader(dataset, batch_size=1024, shuffle=True)
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0 if self.getLocalMode() else 4
+            )
             
             # Set up optimizer and loss function
-            optimizer = optim.Adam(network.parameters())
+            optimizer = optim.Adam(network.parameters(), lr=0.01 if self.getLocalMode() else 0.001)
             if hasattr(self, 'labelCols') and self.labelCols:
                 criterion = nn.BCEWithLogitsLoss()  # Multi-task uses BCE
             else:
@@ -169,9 +200,13 @@ class SparkTabNetEstimator(Estimator, HasInputCol, HasOutputCol, HasLabelCol,
             
             # Training loop
             network.train()
-            for epoch in range(50):  # Fixed number of epochs for testing
+            for epoch in range(num_epochs):
                 total_loss = 0
                 for batch_features, batch_labels in loader:
+                    if self.getLocalMode():
+                        # More frequent logging in local mode
+                        if epoch % 2 == 0:
+                            logger.info(f"Local mode - Epoch {epoch}/{num_epochs}")
                     optimizer.zero_grad()
                     output, _ = network(batch_features)
                     
@@ -190,7 +225,7 @@ class SparkTabNetEstimator(Estimator, HasInputCol, HasOutputCol, HasLabelCol,
                     optimizer.step()
                     total_loss += loss.item()
             
-            return {
+            model_data = {
                 'network': network,
                 'classes_': unique_labels if not hasattr(self, 'labelCols') or not self.labelCols else None,
                 'input_dim': input_dim,
@@ -203,6 +238,13 @@ class SparkTabNetEstimator(Estimator, HasInputCol, HasOutputCol, HasLabelCol,
                 'cat_dims': self.getCatDims(),
                 'labelCols': self.labelCols if hasattr(self, 'labelCols') else None
             }
+            
+            # Add multiclass flag if applicable
+            if hasattr(self, '_is_multiclass'):
+                model_data['is_multiclass'] = True
+                model_data['classes_'] = unique_labels
+            
+            return model_data
 
         # Check and warn about multi-task learning
         if hasattr(self, 'labelCols') and self.labelCols:
@@ -213,7 +255,12 @@ class SparkTabNetEstimator(Estimator, HasInputCol, HasOutputCol, HasLabelCol,
         self.model_data = train_func()
 
         # Create and return the model
-        return SparkTabNetModel(tabnet_model=self.model_data)
+        model = SparkTabNetModel(tabnet_model=self.model_data)
+        # Pass multiclass flag and classes if applicable
+        if hasattr(self, '_is_multiclass'):
+            model._is_multiclass = True
+            model._classes = self.model_data['classes_']
+        return model
 
     def _prepare_data(self, dataset: DataFrame):
         """Prepare data for training."""
@@ -257,18 +304,22 @@ class SparkTabNetModel(Model, HasInputCol, HasOutputCol,
             # Handle both dict and SimpleNamespace
             if hasattr(tabnet_model, '__getitem__'):  # Dict-like
                 self._network = tabnet_model['network']
-                self._tabnet = self._network  # Alias for MLflow compatibility
+                self.tabnet = self._network  # Public alias for MLflow compatibility
+                self._tabnet = self._network  # Private alias for test compatibility
                 self._classes = tabnet_model.get('classes_')
                 self._input_dim = tabnet_model['input_dim']
                 self._output_dim = tabnet_model['output_dim']
                 self.labelCols = tabnet_model.get('labelCols')
+                self._is_multiclass = tabnet_model.get('is_multiclass', False)
+                self._sync_model_state = self._sync_model_state_method
             else:  # SimpleNamespace
                 self._network = tabnet_model.network
-                self._tabnet = self._network  # Alias for MLflow compatibility
+                self.tabnet = self._network  # Public alias for MLflow compatibility
                 self._classes = getattr(tabnet_model, 'classes_', None)
                 self._input_dim = tabnet_model.input_dim
                 self._output_dim = tabnet_model.output_dim
                 self.labelCols = getattr(tabnet_model, 'labelCols', None)
+                self._sync_model_state = True
             
         # Set random seed for consistent predictions
         torch.manual_seed(42)
@@ -276,6 +327,13 @@ class SparkTabNetModel(Model, HasInputCol, HasOutputCol,
             inputCol="features",
             outputCol="predictions"
         )
+
+    def _sync_model_state_method(self):
+        """Synchronize model state across workers."""
+        if hasattr(self, '_network'):
+            self._network.eval()
+            return True
+        return False
 
     def predict(self, context, model_input):
         """MLflow model prediction method."""
@@ -500,32 +558,78 @@ class SparkTabNetModel(Model, HasInputCol, HasOutputCol,
         self._network.eval()
         with torch.no_grad():
             predictions, _ = self._network(features_tensor)
+            # Handle multi-task case first
             if self.labelCols:
-                # Multi-task case
+                # Only use first task's predictions
+                predictions = predictions[:, 0:1]  # Keep only first task
                 predictions = torch.sigmoid(predictions)
                 predictions = (predictions > 0.5).float()
+            elif hasattr(self, '_is_multiclass') and self._is_multiclass:
+                # Multiclass case - use softmax for proper probability distribution
+                predictions = torch.nn.functional.softmax(predictions, dim=1)
+                # Convert to double for higher precision
+                predictions = predictions.double()
+                # Add small epsilon to avoid numerical issues
+                epsilon = 1e-7
+                predictions = predictions + epsilon
+                # Ensure probabilities sum to 1
+                predictions = predictions / predictions.sum(dim=1, keepdim=True)
+                # Convert back to float
+                predictions = predictions.float()
+                # Verify shape matches number of classes
+                if predictions.shape[1] != len(self._classes):
+                    raise ValueError(f"Expected {len(self._classes)} classes but got {predictions.shape[1]}")
             else:
-                if self._output_dim == 1:
-                    predictions = torch.sigmoid(predictions.squeeze())
-                    predictions = (predictions > 0.5).float()
-                else:
-                    predictions = torch.argmax(predictions, dim=1)
+                # Binary classification
+                predictions = torch.sigmoid(predictions.squeeze())
+                predictions = (predictions > 0.5).float()
+                # Reshape to match expected format
+                predictions = predictions.reshape(-1, 1)
         
-        # Convert predictions to list and ensure numpy array format
+        # Convert predictions to numpy array
         predictions = predictions.detach().cpu().numpy()
-        predictions = [pred.tolist() if isinstance(pred, np.ndarray) else [float(pred)] for pred in predictions]
-        predictions = np.array(predictions)
+        
+        # Convert to list format, ensuring proper shape
+        if self.labelCols:
+            # Multi-task case - already sliced to first task only
+            predictions = [[float(p[0])] for p in predictions]
+        elif hasattr(self, '_is_multiclass') and self._is_multiclass:
+            # Multiclass case - ensure we have all class probabilities
+            predictions_list = []
+            for row in predictions:
+                # Convert to float and normalize
+                probs = [float(p) for p in row]
+                # Add small epsilon to avoid numerical issues
+                epsilon = 1e-7
+                probs = [p + epsilon for p in probs]
+                total = sum(probs)
+                probs = [p / total for p in probs]
+                predictions_list.append(probs)
+            predictions = predictions_list
+        else:
+            # Binary classification case
+            predictions = [[float(p)] for p in predictions]
+            
+        predictions = np.array(predictions, dtype=np.float32)
         
         def create_prediction_array(x):
+            if x is None:
+                return [0.0] * (len(self._classes) if hasattr(self, '_is_multiclass') and self._is_multiclass else 1)
+                
+            # Convert input to list if it's not already
+            x_list = x if isinstance(x, (list, np.ndarray)) else [x]
+            
             if self.labelCols:
-                # Multi-task case - return only first prediction as per warning message
-                if isinstance(x, (list, np.ndarray)):
-                    return [float(x[0])]
-                else:
-                    return [float(x)]
+                # Multi-task case - always return first prediction only
+                return [float(x_list[0]) if x_list[0] is not None else 0.0]
+            elif hasattr(self, '_is_multiclass') and self._is_multiclass:
+                # Multiclass case - ensure we have all class probabilities
+                if len(x_list) != len(self._classes):
+                    raise ValueError(f"Expected {len(self._classes)} predictions, got {len(x_list)}")
+                return [float(val) if val is not None else 0.0 for val in x_list]
             else:
-                # Single task case - return single prediction as array
-                return [float(x)]
+                # Binary classification - return single prediction
+                return [float(x_list[0]) if x_list[0] is not None else 0.0]
         
         predict_udf = udf(create_prediction_array, ArrayType(DoubleType()))
         
@@ -534,19 +638,44 @@ class SparkTabNetModel(Model, HasInputCol, HasOutputCol,
         spark = SparkSession.builder.getOrCreate()
         
         # Create a DataFrame with row indices and predictions
-        # For multi-task, take first task's predictions as per warning message
-        pred_df = spark.createDataFrame(
-            [(float(i), float(predictions[i][0] if len(predictions.shape) > 1 else predictions[i]))
-             for i in range(len(predictions))],
-            ["row_idx", "prediction"]
-        )
+        if self.labelCols:
+            # Multi-task case - take only first prediction
+            pred_df = spark.createDataFrame(
+                [(float(i), [float(predictions[i][0])])
+                 for i in range(len(predictions))],
+                ["row_idx", "prediction"]
+            )
+        elif hasattr(self, '_is_multiclass') and self._is_multiclass:
+            # Multiclass case - ensure we have all class probabilities
+            pred_list = []
+            for i in range(len(predictions)):
+                # Convert to float and normalize
+                probs = [float(p) for p in predictions[i]]
+                # Add small epsilon to avoid numerical issues
+                epsilon = 1e-7
+                probs = [p + epsilon for p in probs]
+                total = sum(probs)
+                probs = [p / total for p in probs]
+                pred_list.append((float(i), probs))
+            pred_df = spark.createDataFrame(pred_list, ["row_idx", "prediction"])
+        else:
+            # Binary classification case
+            pred_df = spark.createDataFrame(
+                [(float(i), [float(predictions[i][0] if len(predictions.shape) > 1 else predictions[i])])
+                 for i in range(len(predictions))],
+                ["row_idx", "prediction"]
+            )
         
         # Add row indices to original dataset
         # Create a monotonically increasing ID without using array
         dataset_with_idx = dataset.withColumn("row_idx", F.monotonically_increasing_id())
         
-        # Join predictions with original dataset
-        result = dataset_with_idx.join(pred_df, "row_idx").drop("row_idx")
+        # Join predictions with original dataset, ensuring we keep all rows
+        result = dataset_with_idx.join(
+            pred_df,
+            "row_idx",
+            "left_outer"  # Use left outer join to keep all rows from original dataset
+        ).drop("row_idx")
         
         # Convert predictions to arrays
         result = result.withColumn("prediction", predict_udf("prediction"))
