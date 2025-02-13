@@ -25,10 +25,10 @@ class TabNetModelWriter(MLWriter):
     def saveImpl(self, path: str) -> None:
         """Implementation of save logic for TabNetModel.
         
-        This implementation follows Spark ML conventions by:
-        1. Saving metadata in MLmodel format
-        2. Using a dedicated model directory for artifacts
-        3. Maintaining clear separation between model data and metadata
+        This implementation follows MLflow Spark conventions by:
+        1. Creating a flat artifact structure with a top-level MLmodel file
+        2. Storing model artifacts in the sparkml directory
+        3. Following MLflow's expected directory structure for both standalone and pipeline models
         
         Args:
             path: Path to save the model
@@ -37,17 +37,6 @@ class TabNetModelWriter(MLWriter):
             ValueError: If there's an error during saving
         """
         try:
-            # Create a temporary directory for local operations
-            temp_dir = tempfile.mkdtemp()
-            
-            # Create model directory for artifacts
-            model_dir = os.path.join(temp_dir, "model")
-            os.makedirs(model_dir, exist_ok=True)
-            
-            # Save torch model state dict
-            model_path = os.path.join(model_dir, "model.pt")
-            torch.save(self.instance._torch_model.state_dict(), model_path)
-            
             # Prepare parameters
             params = {
                 "input_dim": self.instance.input_dim,
@@ -57,108 +46,83 @@ class TabNetModelWriter(MLWriter):
                 **self.instance._get_model_params()
             }
             
-            # Save parameters
-            params_path = os.path.join(model_dir, "params.json")
-            with open(params_path, "w") as f:
-                json.dump(params, f, indent=2)
-            
-            # Create MLmodel metadata following Spark ML conventions
+            # Create base metadata
             metadata = {
                 "class": "pytorch_tabnet.spark.tabnet_pyspark.TabNetModel",
                 "timestamp": int(time.time() * 1000),
-                "sparkVersion": "3.4.0",  # Use appropriate version
+                "sparkVersion": "3.4.0",
                 "uid": self.instance.uid,
-                "params": params,
-                "modelData": {
-                    "format": "pytorch",
-                    "path": "model/model.pt"
-                },
-                "parameterData": {
-                    "format": "json",
-                    "path": "model/params.json"
-                }
+                "params": params
             }
             
-            # Log the save path for debugging
-            logging.info(f"Saving TabNet model to path: {path}")
+            # Check if this is a pipeline stage
+            is_pipeline_stage = "stages" in path.split(os.sep)
             
-            # Save MLmodel metadata in root directory and model directory
-            mlmodel_paths = [
-                os.path.join(path, "MLmodel"),  # Root MLmodel
-                os.path.join(path, "model", "MLmodel")  # Model dir MLmodel
-            ]
-            for mlmodel_path in mlmodel_paths:
-                os.makedirs(os.path.dirname(mlmodel_path), exist_ok=True)
-                with open(mlmodel_path, "w") as f:
-                    json.dump(metadata, f, indent=2)
-                logging.info(f"Saved MLmodel to: {mlmodel_path}")
-
-            # Copy model files to target path
-            target_model_dir = os.path.join(path, "model")
-            os.makedirs(os.path.dirname(target_model_dir), exist_ok=True)
-            shutil.copytree(model_dir, target_model_dir, dirs_exist_ok=True)
-            
-            # Handle pipeline stage paths
-            path_parts = path.split(os.sep)
-            if "stages" in path_parts:
-                stages_idx = path_parts.index("stages")
-                if stages_idx < len(path_parts) - 1:
-                    # Extract stage number from directory name (e.g., "2_TabNetModel_xyz" -> "2")
-                    stage_dir = path_parts[stages_idx + 1]
-                    stage_num = stage_dir.split("_")[0]
-                    try:
-                        int(stage_num)  # Validate it's a number
-                        # Create clean stage path without model name/uid
-                        pipeline_root = os.path.dirname(os.path.dirname(path))  # Go up two levels from stage dir
-                        stage_path = os.path.abspath(os.path.join(pipeline_root, "stages", stage_num))
-                        
-                        # Create stage directories
-                        stage_model_dir = os.path.join(stage_path, "model")
-                        os.makedirs(stage_model_dir, exist_ok=True)
-                        
-                        # Copy model files from the target model directory
-                        model_files = ["model.pt", "params.json"]
-                        for file in model_files:
-                            src = os.path.join(target_model_dir, file)
-                            dst = os.path.join(stage_model_dir, file)
-                            logging.info(f"Copying model file from {src} to {dst}")
-                            shutil.copy2(src, dst)
-                            logging.info(f"Successfully copied to {dst}")
-                        
-                        # Save MLmodel in both stage root and model directories
-                        stage_mlmodel_paths = [
-                            os.path.join(stage_path, "MLmodel"),  # Stage root MLmodel
-                            os.path.join(stage_path, "model", "MLmodel")  # Stage model dir MLmodel
-                        ]
-                        for stage_mlmodel in stage_mlmodel_paths:
-                            os.makedirs(os.path.dirname(stage_mlmodel), exist_ok=True)
-                            with open(stage_mlmodel, "w") as f:
-                                json.dump(metadata, f, indent=2)
-                            logging.info(f"Saved stage MLmodel to: {stage_mlmodel}")
-                    except (ValueError, IndexError) as e:
-                        logging.warning(f"Failed to save stage MLmodel: {str(e)}")
-            
-            # Save Spark-compatible metadata using DefaultParamsWriter
+            # Save Spark-compatible metadata
             DefaultParamsWriter.saveMetadata(
                 self.instance,
                 path,
                 self.sc,
-                extraMetadata={
-                    "class": "pytorch_tabnet.spark.tabnet_pyspark.TabNetModel",
-                    "timestamp": metadata["timestamp"],
-                    "sparkVersion": metadata["sparkVersion"],
-                    "uid": self.instance.uid
-                }
+                extraMetadata=metadata
             )
+            
+            # Create sparkml directory
+            sparkml_dir = os.path.join(path, "sparkml")
+            os.makedirs(sparkml_dir, exist_ok=True)
+            
+            # Save model artifacts in sparkml directory
+            torch.save(self.instance._torch_model.state_dict(), os.path.join(sparkml_dir, "model.pt"))
+            
+            with open(os.path.join(sparkml_dir, "params.json"), "w") as f:
+                json.dump(params, f, indent=2)
+                
+            with open(os.path.join(sparkml_dir, "metadata"), "w") as f:
+                json.dump(metadata, f, indent=2)
+            
+            # Create MLmodel metadata with proper paths
+            mlmodel_dict = {
+                **metadata,
+                "flavors": {
+                    "spark": {
+                        "model_data": "sparkml",
+                        "spark_version": "3.4.0"
+                    },
+                    "python_function": {
+                        "loader_module": "mlflow.spark",
+                        "model_path": "sparkml"
+                    }
+                }
+            }
+            
+            # Save MLmodel file at root level (for both standalone and pipeline stages)
+            mlmodel_path = os.path.join(path, "MLmodel")
+            with open(mlmodel_path, "w") as f:
+                json.dump(mlmodel_dict, f, indent=2)
+            
+            # Save environment files only for standalone models
+            if not is_pipeline_stage:
+                with open(os.path.join(path, "requirements.txt"), "w") as f:
+                    f.write("mlflow==2.12.2\n")
+                    f.write("pyspark==3.4.0\n")
+                    f.write("torch==2.2.1\n")
+                
+                with open(os.path.join(path, "python_env.yaml"), "w") as f:
+                    f.write("python: 3.11.9\n")
+                    f.write("build_dependencies:\n")
+                    f.write("  - pip\n")
+                    f.write("dependencies:\n")
+                    f.write("  - python=3.11.9\n")
+                    f.write("  - pip:\n")
+                    f.write("    - mlflow==2.12.2\n")
+                    f.write("    - pyspark==3.4.0\n")
+                    f.write("    - torch==2.2.1\n")
             
         except Exception as e:
             msg = f"Error saving model: {str(e)}"
             logging.error(msg)
             raise ValueError(msg)
         finally:
-            # Clean up temporary directory
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+            pass  # No cleanup needed
 
 
 class TabNetModelReader(MLReader["TabNetModel"]):
@@ -166,14 +130,14 @@ class TabNetModelReader(MLReader["TabNetModel"]):
     
     def __init__(self):
         super().__init__()
+        
     def load(self, path: str) -> "TabNetModel":
         """Load TabNetModel from disk or MLflow artifact store.
         
-        This implementation:
-        1. Handles MLflow URIs by downloading artifacts
-        2. Reads metadata from MLmodel file
-        3. Uses factory function to create TabNet model
-        4. Validates loaded model parameters
+        This implementation follows MLflow's expected directory structure:
+        1. Reads metadata from top-level MLmodel file
+        2. Loads model artifacts from sparkml directory
+        3. Creates and validates the TabNet model
         
         Args:
             path: Path to the saved model or MLflow URI
@@ -194,64 +158,29 @@ class TabNetModelReader(MLReader["TabNetModel"]):
                         run_id=run_id,
                         artifact_path=artifact_path
                     )
-                except mlflow.exceptions.MlflowException:
-                    msg = "Model path does not exist and artifact store fallback failed"
-                    logging.error(msg)
-                    raise ValueError(msg)
+                except mlflow.exceptions.MlflowException as e:
+                    raise ValueError("Model path does not exist and artifact store fallback failed")
             
-            # Check if path exists after potential MLflow download
+            # Check if path exists
             if not os.path.exists(path):
-                msg = "Model path does not exist and artifact store fallback failed"
-                logging.error(msg)
-                raise ValueError(msg)
-                
-            # Load Spark metadata using DefaultParamsReader
-            try:
-                metadata = DefaultParamsReader.loadMetadata(path, self.sc)
-            except Exception:
-                # If Spark metadata doesn't exist, try to create it from MLmodel
-                mlmodel_path = os.path.join(path, "MLmodel")
-                if os.path.exists(mlmodel_path):
-                    with open(mlmodel_path, "r") as f:
-                        mlmodel_metadata = json.load(f)
-                    
-                    # Save as Spark metadata
-                    DefaultParamsWriter.saveMetadata(
-                        TabNetModel(),  # Temporary instance for metadata
-                        path,
-                        self.sc,
-                        extraMetadata={
-                            "class": mlmodel_metadata.get("class", "pytorch_tabnet.spark.tabnet_pyspark.TabNetModel"),
-                            "timestamp": mlmodel_metadata.get("timestamp", int(time.time() * 1000)),
-                            "sparkVersion": mlmodel_metadata.get("sparkVersion", "3.4.0"),
-                            "uid": mlmodel_metadata.get("uid", "")
-                        }
-                    )
-                    metadata = DefaultParamsReader.loadMetadata(path, self.sc)
+                raise ValueError("Model path does not exist")
             
             # Load MLmodel metadata
             mlmodel_path = os.path.join(path, "MLmodel")
             if not os.path.exists(mlmodel_path):
-                msg = "MLmodel file not found"
-                logging.error(msg)
-                raise ValueError(msg)
-
+                raise ValueError("Model path does not exist and artifact store fallback failed")
+            
             with open(mlmodel_path, "r") as f:
                 metadata = json.load(f)
-
+            
             # Verify metadata
             if metadata.get("class") != "pytorch_tabnet.spark.tabnet_pyspark.TabNetModel":
-                msg = f"Invalid model class in metadata: {metadata.get('class')}"
-                logging.error(msg)
-                raise ValueError(msg)
-
-            # Load parameters
+                raise ValueError(f"Invalid model class in metadata: {metadata.get('class')}")
+            
             params = metadata.get("params", {})
             if not params:
-                msg = "No parameters found in metadata"
-                logging.error(msg)
-                raise ValueError(msg)
-
+                raise ValueError("No parameters found in metadata")
+            
             # Create TabNetModel instance
             model = TabNetModel(
                 inputCol=params["inputCol"],
@@ -259,28 +188,23 @@ class TabNetModelReader(MLReader["TabNetModel"]):
                 input_dim=params["input_dim"],
                 output_dim=params["output_dim"]
             )
-
-            # Set model parameters
+            
             model.setParams(**{k: v for k, v in params.items()
                              if k not in ["input_dim", "output_dim", "inputCol", "outputCol"]})
-
+            
             # Create TabNet instance using factory
             model._torch_model = create_tabnet_model(params)
-
-            # Load model state dict
-            model_path = os.path.join(path, "model", "model.pt")
+            
+            # Load model state dict from sparkml directory
+            model_path = os.path.join(path, "sparkml", "model.pt")
             if not os.path.exists(model_path):
-                msg = "Model state dict file not found"
-                logging.error(msg)
-                raise ValueError(msg)
-
+                raise ValueError("Model state dict not found in sparkml directory")
+            
             model._torch_model.load_state_dict(torch.load(model_path))
-
-            # Validate loaded model
             validate_loaded_model(model._torch_model, params)
-
+            
             return model
-
+        
         except Exception as e:
             msg = f"Error loading model: {str(e)}"
             logging.error(msg)
@@ -295,8 +219,8 @@ def save_pipeline_model(
     """Save a pipeline model containing TabNet, ensuring proper metadata.
     
     This utility function ensures that when a pipeline containing TabNet
-    is saved, all stages (including TabNet) have proper metadata and
-    can be loaded correctly.
+    is saved, all stages (including TabNet) follow MLflow's expected
+    directory structure with proper metadata and artifact organization.
     
     Args:
         pipeline_model: Pipeline model to save
@@ -308,7 +232,6 @@ def save_pipeline_model(
     if not isinstance(pipeline_model, PipelineModel):
         raise ValueError("Input must be a PipelineModel instance")
     
-    # Create target directory
     if os.path.exists(path):
         if overwrite:
             shutil.rmtree(path)
@@ -317,94 +240,142 @@ def save_pipeline_model(
     
     os.makedirs(path)
     
-    # Save pipeline metadata
+    # Create stages directory at root level
+    stages_path = os.path.join(path, "stages")
+    os.makedirs(stages_path, exist_ok=True)
+    
+    # Create sparkml directory for pipeline
+    sparkml_path = os.path.join(path, "sparkml")
+    os.makedirs(sparkml_path, exist_ok=True)
+    
+    # Create pipeline metadata with MLflow flavors
     metadata = {
         "class": "pyspark.ml.pipeline.PipelineModel",
         "timestamp": int(time.time() * 1000),
         "sparkVersion": "3.4.0",
         "uid": pipeline_model.uid,
-        "stages": []
+        "stages": [],
+        "flavors": {
+            "spark": {
+                "model_data": "sparkml",
+                "spark_version": "3.4.0"
+            },
+            "python_function": {
+                "loader_module": "mlflow.spark",
+                "model_path": "sparkml"
+            }
+        }
     }
     
-    # Save each stage
     for i, stage in enumerate(pipeline_model.stages):
-        stage_path = os.path.join(path, f"stages/{i}")
-        os.makedirs(stage_path)
+        # Create stage directory with simple numeric index
+        stage_path = os.path.join(stages_path, str(i))
+        os.makedirs(stage_path, exist_ok=True)
         
-        # Save stage and ensure MLmodel exists
-        stage.save(stage_path)
-        
-        # For TabNet stages, ensure MLmodel is in the correct location
         if isinstance(stage, TabNetModel):
-            # Get metadata from the stage
+            # Create stage directory under sparkml/stages with index prefix
+            stage_name = f"{i}_{stage.__class__.__name__}_{stage.uid.split('_')[-1]}"
+            stage_path = os.path.join(stages_path, stage_name)
+            os.makedirs(stage_path, exist_ok=True)
+            
+            # Create sparkml directory for stage artifacts
+            stage_sparkml_path = os.path.join(stage_path, "sparkml")
+            os.makedirs(stage_sparkml_path, exist_ok=True)
+            
+            # Prepare stage metadata
+            stage_params = {
+                "input_dim": stage.input_dim,
+                "output_dim": stage.output_dim,
+                "inputCol": stage.getInputCol(),
+                "outputCol": stage.getOutputCol(),
+                **stage._get_model_params()
+            }
+            
             stage_metadata = {
                 "class": "pytorch_tabnet.spark.tabnet_pyspark.TabNetModel",
                 "timestamp": int(time.time() * 1000),
                 "sparkVersion": "3.4.0",
                 "uid": stage.uid,
-                "params": {
-                    "input_dim": stage.input_dim,
-                    "output_dim": stage.output_dim,
-                    "inputCol": stage.getInputCol(),
-                    "outputCol": stage.getOutputCol(),
-                    **stage._get_model_params()
+                "params": stage_params,
+                "flavors": {
+                    "spark": {
+                        "model_data": "sparkml",
+                        "spark_version": "3.4.0"
+                    },
+                    "python_function": {
+                        "loader_module": "mlflow.spark",
+                        "model_path": "sparkml"
+                    }
                 }
             }
             
-            # For TabNet stages, save files in both original and MLflow paths
-            if isinstance(stage, TabNetModel):
-                # Create temporary directory for stage files
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    # Save files in temporary directory
-                    model_dir = os.path.join(temp_dir, "model")
-                    os.makedirs(model_dir, exist_ok=True)
-                    
-                    # Save torch model state dict
-                    model_path = os.path.join(model_dir, "model.pt")
-                    torch.save(stage._torch_model.state_dict(), model_path)
-                    
-                    # Save parameters
-                    params_path = os.path.join(model_dir, "params.json")
-                    with open(params_path, "w") as f:
-                        json.dump(stage_metadata["params"], f, indent=2)
-                    
-                    # Save MLmodel file
-                    mlmodel_path = os.path.join(temp_dir, "MLmodel")
-                    with open(mlmodel_path, "w") as f:
-                        json.dump(stage_metadata, f, indent=2)
-                    
-                    # Save files in MLflow sparkml path with correct naming pattern
-                    stage_name = f"{i}_TabNetModel_{stage.uid}"
-                    stage_path = os.path.join(path, "sparkml", "stages", stage_name)
-                    os.makedirs(stage_path, exist_ok=True)
-                    
-                    # Save MLmodel in stage root
-                    stage_mlmodel = os.path.join(stage_path, "MLmodel")
-                    with open(stage_mlmodel, "w") as f:
-                        json.dump(stage_metadata, f, indent=2)
-                    logging.info(f"Saved stage MLmodel to: {stage_mlmodel}")
-                    
-                    # Create model directory and save files
-                    model_dir = os.path.join(stage_path, "model")
-                    os.makedirs(model_dir, exist_ok=True)
-                    
-                    # Save model files
-                    torch.save(stage._torch_model.state_dict(), os.path.join(model_dir, "model.pt"))
-                    with open(os.path.join(model_dir, "params.json"), "w") as f:
-                        json.dump(stage_metadata["params"], f, indent=2)
-                    with open(os.path.join(model_dir, "MLmodel"), "w") as f:
-                        json.dump(stage_metadata, f, indent=2)
-                    
-                    logging.info(f"Saved stage files to: {stage_path}")
+            # Save model artifacts in sparkml directory
+            torch.save(stage._torch_model.state_dict(), os.path.join(stage_sparkml_path, "model.pt"))
+            
+            # Save metadata files in sparkml directory
+            with open(os.path.join(stage_sparkml_path, "params.json"), "w") as f:
+                json.dump(stage_params, f, indent=2)
+            
+            with open(os.path.join(stage_sparkml_path, "metadata"), "w") as f:
+                json.dump(stage_metadata, f, indent=2)
+            
+            # Save MLmodel at stage root
+            with open(os.path.join(stage_path, "MLmodel"), "w") as f:
+                json.dump(stage_metadata, f, indent=2)
+            
+            logging.info(f"Saved TabNet stage to: {stage_path}")
+        else:
+            # For non-TabNet stages, use standard save
+            stage.save(os.path.join(stages_path, str(i)))
+        # Add stage to pipeline metadata with proper path
+        stage_class = stage.__class__.__module__ + "." + stage.__class__.__name__
+        metadata["stages"].append({
+            "class": stage_class,
+            "path": f"sparkml/stages/{i}"
+        })
         
-        # Add stage metadata
-        stage_metadata = {
-            "class": stage.__class__.__module__ + "." + stage.__class__.__name__,
-            "path": f"stages/{i}"
-        }
-        metadata["stages"].append(stage_metadata)
+        # Update stage metadata to point to correct paths
+        if isinstance(stage, TabNetModel):
+            stage_metadata = {
+                "class": "pytorch_tabnet.spark.tabnet_pyspark.TabNetModel",
+                "timestamp": int(time.time() * 1000),
+                "sparkVersion": "3.4.0",
+                "uid": stage.uid,
+                "params": stage_params,
+                "flavors": {
+                    "spark": {
+                        "model_data": "sparkml",
+                        "spark_version": "3.4.0"
+                    },
+                    "python_function": {
+                        "loader_module": "mlflow.spark",
+                        "model_path": "sparkml"
+                    }
+                }
+            }
+            
+            # Update MLmodel at stage root
+            stage_mlmodel_path = os.path.join(stages_path, str(i), "MLmodel")
+            with open(stage_mlmodel_path, "w") as f:
+                json.dump(stage_metadata, f, indent=2)
     
-    # Save pipeline metadata
-    metadata_path = os.path.join(path, "MLmodel")
-    with open(metadata_path, "w") as f:
+    # Save pipeline MLmodel file
+    with open(os.path.join(path, "MLmodel"), "w") as f:
         json.dump(metadata, f, indent=2)
+    
+    # Save environment files
+    with open(os.path.join(path, "requirements.txt"), "w") as f:
+        f.write("mlflow==2.12.2\n")
+        f.write("pyspark==3.4.0\n")
+        f.write("torch==2.2.1\n")
+    
+    with open(os.path.join(path, "python_env.yaml"), "w") as f:
+        f.write("python: 3.11.9\n")
+        f.write("build_dependencies:\n")
+        f.write("  - pip\n")
+        f.write("dependencies:\n")
+        f.write("  - python=3.11.9\n")
+        f.write("  - pip:\n")
+        f.write("    - mlflow==2.12.2\n")
+        f.write("    - pyspark==3.4.0\n")
+        f.write("    - torch==2.2.1\n")

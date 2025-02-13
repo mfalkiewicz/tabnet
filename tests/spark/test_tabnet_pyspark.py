@@ -11,6 +11,7 @@ import mlflow.pytorch
 import mlflow.spark
 import mlflow.pyfunc
 import json
+import time
 from unittest.mock import patch, MagicMock
 import logging
 from pyspark.sql.types import StructType, StructField, DoubleType, ArrayType, FloatType
@@ -174,9 +175,10 @@ def test_mlwritable_mlreadable(small_data, tmp_path):
     model_path = str(tmp_path / "mlwriter_model")
     writer.save(model_path)
     assert os.path.exists(model_path)
-    assert os.path.exists(os.path.join(model_path, "model"))
-    assert os.path.exists(os.path.join(model_path, "model", "model.pt"))
-    assert os.path.exists(os.path.join(model_path, "model", "params.json"))
+    assert os.path.exists(os.path.join(model_path, "sparkml"))
+    assert os.path.exists(os.path.join(model_path, "sparkml", "model.pt"))
+    assert os.path.exists(os.path.join(model_path, "sparkml", "params.json"))
+    assert os.path.exists(os.path.join(model_path, "sparkml", "metadata"))
     
     # Test MLReadable interface
     reader = TabNetModel.read()
@@ -276,6 +278,7 @@ def test_multiclass_training(multiclass_data):
         assert len(row.prediction) == n_classes
         assert all(isinstance(x, (int, float)) for x in row.prediction)
         assert np.allclose(sum(row.prediction), 1.0)  # Probabilities sum to 1
+
 
 @pytest.mark.integration
 def test_mlflow_integration(large_data, tmp_path):
@@ -448,35 +451,64 @@ def test_mlflow_flavors(small_data, tmp_path):
         model_path = os.path.join(tmp_path, "models")
         os.makedirs(model_path, exist_ok=True)
         
-        # Save PyTorch model
-        torch_path = os.path.join(model_path, "pytorch_model")
-        mlflow.pytorch.save_model(model._torch_model, torch_path)
-        mlflow.log_artifact(torch_path, "pytorch_model")
+        # Log PyTorch model with MLflow
+        mlflow.pytorch.log_model(
+            pytorch_model=model._torch_model,
+            artifact_path="pytorch_model",
+            registered_model_name="tabnet_pytorch"
+        )
         
-        # Create TabNet model directory
+        # Create TabNet model directory with MLflow structure
         tabnet_path = os.path.join(model_path, "spark_model")
         os.makedirs(tabnet_path, exist_ok=True)
         
-        # Save model files
-        model_files_path = os.path.join(tabnet_path, "model")
-        os.makedirs(model_files_path, exist_ok=True)
-        model.save(model_files_path)
-        
-        # Create metadata file
-        metadata = {
-            "model_type": "TabNetModel",
+        # Create MLmodel file
+        mlmodel_dict = {
+            "flavors": {
+                "spark": {
+                    "model_data": "sparkml",
+                    "spark_version": "3.4.0"
+                },
+                "python_function": {
+                    "loader_module": "mlflow.spark",
+                    "model_path": "sparkml"
+                }
+            },
             "class": "pytorch_tabnet.spark.tabnet_pyspark.TabNetModel",
-            "input_dim": model.input_dim,
-            "output_dim": model.output_dim,
-            "params": model._get_model_params()
+            "timestamp": int(time.time() * 1000),
+            "sparkVersion": "3.4.0",
+            "uid": model.uid,
+            "params": {
+                "input_dim": model.input_dim,
+                "output_dim": model.output_dim,
+                "inputCol": model.getInputCol(),
+                "outputCol": model.getOutputCol(),
+                **model._get_model_params()
+            }
         }
         
-        metadata_path = os.path.join(tabnet_path, "metadata.json")
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
+        mlmodel_path = os.path.join(tabnet_path, "MLmodel")
+        with open(mlmodel_path, "w") as f:
+            json.dump(mlmodel_dict, f, indent=2)
+        
+        # Save model files in sparkml structure
+        sparkml_path = os.path.join(tabnet_path, "sparkml")
+        os.makedirs(sparkml_path, exist_ok=True)
+        
+        # Save torch model state dict
+        torch.save(model._torch_model.state_dict(), os.path.join(sparkml_path, "model.pt"))
+        
+        # Save parameters
+        with open(os.path.join(sparkml_path, "params.json"), "w") as f:
+            json.dump(mlmodel_dict["params"], f, indent=2)
+        
+        # Save metadata
+        with open(os.path.join(sparkml_path, "metadata"), "w") as f:
+            json.dump(mlmodel_dict, f, indent=2)
         
         # Log TabNet model directory
         mlflow.log_artifacts(tabnet_path, "spark_model")
+        
         # Create and log pipeline
         pipeline = Pipeline(stages=[model])
         fitted_pipeline = pipeline.fit(small_data)
@@ -496,23 +528,24 @@ def test_mlflow_flavors(small_data, tmp_path):
         model_uri = f"runs:/{run.info.run_id}/spark_model"
         loaded_path = mlflow.artifacts.download_artifacts(model_uri)
         
-        # Load metadata
-        metadata_path = os.path.join(loaded_path, "metadata.json")
-        with open(metadata_path, "r") as f:
+        # Load MLmodel file
+        mlmodel_path = os.path.join(loaded_path, "MLmodel")
+        with open(mlmodel_path, "r") as f:
             metadata = json.load(f)
         
         # Verify metadata
-        assert metadata["model_type"] == "TabNetModel"
         assert metadata["class"] == "pytorch_tabnet.spark.tabnet_pyspark.TabNetModel"
+        assert "flavors" in metadata
+        assert "spark" in metadata["flavors"]
+        assert "python_function" in metadata["flavors"]
         
         # Load model using appropriate class
-        model_path = os.path.join(loaded_path, "model")
-        spark_model = TabNetModel.load(model_path)
-        assert isinstance(spark_model, TabNetModel), f"Expected TabNetModel but got {type(spark_model)}"
+        spark_model = TabNetModel.load(loaded_path)
+        assert isinstance(spark_model, TabNetModel)
         
         # Verify model parameters
-        assert spark_model.input_dim == metadata["input_dim"]
-        assert spark_model.output_dim == metadata["output_dim"]
+        assert spark_model.input_dim == mlmodel_dict["params"]["input_dim"]
+        assert spark_model.output_dim == mlmodel_dict["params"]["output_dim"]
         
         # Get original predictions
         original_preds = model.transform(small_data).select("prediction").collect()
@@ -527,9 +560,7 @@ def test_mlflow_flavors(small_data, tmp_path):
             np.testing.assert_array_almost_equal(orig.prediction, pipe.prediction)
         
         # Verify predictions match
-        original_preds = model.transform(small_data).select("prediction").collect()
         loaded_preds = spark_model.transform(small_data).select("prediction").collect()
-        
         for orig, loaded in zip(original_preds, loaded_preds):
             np.testing.assert_array_almost_equal(orig.prediction, loaded.prediction)
 
