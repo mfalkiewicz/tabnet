@@ -9,10 +9,10 @@ from pytorch_tabnet.spark.provider import (
     SparkDataset,
     create_spark_loader,
 )
-from pytorch_tabnet.spark.transformer import (
+from pytorch_tabnet.spark.tabnet_pyspark import (
     TabNetParams,
-    SparkTabNetEstimator,
-    SparkTabNetModel,
+    TabNetEstimator,
+    TabNetModel,
 )
 
 __all__ = [
@@ -20,6 +20,6 @@ __all__ = [
     "SparkDataset",
     "create_spark_loader",
     "TabNetParams",
-    "SparkTabNetEstimator", 
-    "SparkTabNetModel",
+    "TabNetEstimator", 
+    "TabNetModel",
 ]

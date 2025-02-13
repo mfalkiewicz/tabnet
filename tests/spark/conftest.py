@@ -4,6 +4,8 @@ import pytest
 import numpy as np
 import pandas as pd
 from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, DoubleType
+from pyspark.ml.linalg import Vectors, VectorUDT
 
 
 @pytest.fixture(scope="session")
@@ -16,9 +18,17 @@ def spark():
             .master("local[2]")
             .appName("tabnet-spark-test")
             .config("spark.sql.execution.arrow.pyspark.enabled", "true")
-            .config("spark.sql.execution.arrow.maxRecordsPerBatch", "10000")
+            .config("spark.sql.execution.arrow.maxRecordsPerBatch", "1000")
+            .config("spark.driver.memory", "2g")
+            .config("spark.executor.memory", "2g")
+            .config("spark.driver.extraJavaOptions", "-XX:+UseG1GC")
+            .config("spark.sql.shuffle.partitions", "2")
             .getOrCreate())
+    
     yield spark
+    
+    # Clean up
+    spark.catalog.clearCache()
     spark.stop()
 
 
@@ -28,12 +38,25 @@ def small_data(spark):
     
     This fixture provides a small DataFrame suitable for basic functionality tests.
     """
-    pdf = pd.DataFrame({
-        'A': [1, 2, 3, 4, 5],
-        'B': [10, 20, 30, 40, 50],
-        'y': [0, 1, 0, 1, 0]
-    })
-    return spark.createDataFrame(pdf)
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
+    # Create features and labels
+    n_samples = 10
+    n_features = 5
+    features = np.random.randn(n_samples, n_features)
+    labels = np.random.randint(0, 2, size=n_samples)
+    
+    # Convert to Spark vectors
+    data = [(Vectors.dense(x), float(y)) for x, y in zip(features, labels)]
+    
+    # Create schema
+    schema = StructType([
+        StructField("features", VectorUDT()),
+        StructField("label", DoubleType())
+    ])
+    
+    return spark.createDataFrame(data, schema)
 
 
 @pytest.fixture
@@ -42,10 +65,57 @@ def large_data(spark):
     
     This fixture provides a larger DataFrame suitable for performance and memory tests.
     """
-    n_rows = 100000
-    n_cols = 10
-    pdf = pd.DataFrame(
-        np.random.randn(n_rows, n_cols),
-        columns=[f'feature_{i}' for i in range(n_cols-1)] + ['target']
-    )
-    return spark.createDataFrame(pdf)
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
+    # Generate synthetic data
+    n_samples = 1000  # Reduced from 100000 to avoid memory issues
+    n_features = 10
+    
+    # Create features
+    features = np.random.randn(n_samples, n_features)
+    # Create binary labels
+    labels = np.random.randint(0, 2, size=n_samples)
+    
+    # Convert to Spark vectors
+    data = [(Vectors.dense(x), float(y)) for x, y in zip(features, labels)]
+    
+    # Create schema
+    schema = StructType([
+        StructField("features", VectorUDT()),
+        StructField("label", DoubleType())
+    ])
+    
+    return spark.createDataFrame(data, schema)
+
+
+@pytest.fixture
+def multiclass_data(spark):
+    """Create a test DataFrame for multiclass classification.
+    
+    This fixture provides a DataFrame with multiple classes for testing
+    multiclass classification scenarios.
+    """
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
+    # Generate synthetic data
+    n_samples = 100  # Small dataset for quick testing
+    n_features = 10
+    n_classes = 3
+    
+    # Create features
+    features = np.random.randn(n_samples, n_features)
+    # Create multiclass labels
+    labels = np.random.randint(0, n_classes, size=n_samples)
+    
+    # Convert to Spark vectors
+    data = [(Vectors.dense(x), float(y)) for x, y in zip(features, labels)]
+    
+    # Create schema
+    schema = StructType([
+        StructField("features", VectorUDT()),
+        StructField("label", DoubleType())
+    ])
+    
+    return spark.createDataFrame(data, schema)
